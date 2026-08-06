@@ -1,6 +1,6 @@
 """
 Cursor-centered aspect-ratio border overlay for Windows.
-Draws a red rectangle (16:9 or 9:16) that follows the mouse, cursor at center.
+Draws a cyan rectangle (16:9 or 9:16) that follows the mouse, cursor at center.
 Press Esc to quit.
 """
 
@@ -23,18 +23,21 @@ VK_ESCAPE = 0x1B
 HWND_TOPMOST = -1
 SWP_NOACTIVATE = 0x0010
 SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
 SWP_SHOWWINDOW = 0x0040
+GA_ROOT = 2
 
-# Line thickness of the red border (pixels)
+# Line thickness of the cyan border (pixels)
 BORDER_WIDTH = 5
-BORDER_COLOR = "#FF0000"
+BORDER_COLOR = "#00FFFF"  # cyan
 # Chroma-key fill (made invisible by Windows layered color-key)
 KEY_COLOR = "#010101"
 KEY_COLORREF = 0x00010101  # 0x00bbggrr for RGB(1,1,1)
 
 # Outer frame size = this fraction of the primary work area
 FRAME_SCALE = 0.55
-UPDATE_MS = 16  # ~60 FPS
+UPDATE_MS = 8  # ~120 FPS — keeps cursor locked to box center
 
 
 class POINT(ctypes.Structure):
@@ -62,7 +65,11 @@ def frame_size(aspect_w: int, aspect_h: int, screen_w: int, screen_h: int, scale
 
 
 def get_hwnd(root: tk.Tk) -> int:
+    """Resolve the real top-level HWND Tk uses for the overlay window."""
     hwnd = int(root.winfo_id())
+    ancestor = int(user32.GetAncestor(hwnd, GA_ROOT))
+    if ancestor:
+        return ancestor
     parent = int(user32.GetParent(hwnd))
     return parent or hwnd
 
@@ -71,12 +78,12 @@ def setup_layered_window(hwnd: int) -> None:
     style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
     style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
     user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-    # Make KEY_COLOR fully transparent; red border stays opaque
+    # Make KEY_COLOR fully transparent; cyan border stays opaque
     user32.SetLayeredWindowAttributes(hwnd, KEY_COLORREF, 0, LWA_COLORKEY)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Red aspect-ratio border centered on the cursor")
+    parser = argparse.ArgumentParser(description="Cyan aspect-ratio border centered on the cursor")
     parser.add_argument(
         "ratio",
         nargs="?",
@@ -138,7 +145,7 @@ def run(ratio: str, scale: float, border_w: int) -> None:
     )
     canvas.pack(fill="both", expand=True)
 
-    # Hollow red frame: four filled bars (center is chroma-keyed away)
+    # Hollow cyan frame: four filled bars (center is chroma-keyed away)
     bw = border_w
     canvas.create_rectangle(0, 0, box_w, bw, fill=BORDER_COLOR, outline="")
     canvas.create_rectangle(0, box_h - bw, box_w, box_h, fill=BORDER_COLOR, outline="")
@@ -146,13 +153,20 @@ def run(ratio: str, scale: float, border_w: int) -> None:
     canvas.create_rectangle(box_w - bw, 0, box_w, box_h, fill=BORDER_COLOR, outline="")
 
     hwnd_holder: dict[str, int] = {"hwnd": 0}
+    last_pos: dict[str, tuple[int, int] | None] = {"xy": None}
 
     def move_to_cursor() -> None:
+        """Place the box so the live cursor sits exactly at its center."""
         cx, cy = get_cursor_pos()
-        x = cx - box_w // 2
-        y = cy - box_h // 2
+        x = cx - (box_w // 2)
+        y = cy - (box_h // 2)
+        if last_pos["xy"] == (x, y):
+            return
+        last_pos["xy"] = (x, y)
+
         hwnd = hwnd_holder["hwnd"]
         if hwnd:
+            # Move the Win32 window directly (smooth, no Tk layout fight)
             user32.SetWindowPos(
                 hwnd,
                 HWND_TOPMOST,
@@ -160,10 +174,10 @@ def run(ratio: str, scale: float, border_w: int) -> None:
                 y,
                 0,
                 0,
-                SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
             )
-        else:
-            root.geometry(f"{box_w}x{box_h}+{x}+{y}")
+        # Keep Tk's idea of geometry in sync as a fallback
+        root.geometry(f"+{x}+{y}")
 
     def tick() -> None:
         # Esc works even when the overlay has no keyboard focus
@@ -184,9 +198,21 @@ def run(ratio: str, scale: float, border_w: int) -> None:
     except tk.TclError:
         pass
 
+    # Pin topmost once, then track without re-asserting z-order every frame
+    user32.SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE,
+    )
+
     print(f"Border active: {ratio}")
     print(f"  Frame size : {box_w} x {box_h} pixels")
-    print(f"  Line width : {border_w} pixels (red)")
+    print(f"  Line width : {border_w} pixels (cyan)")
+    print("  Cursor stays at the center of the box while you move.")
     print("  Press Esc to quit.")
     move_to_cursor()
     tick()

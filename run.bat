@@ -12,7 +12,7 @@ echo.
 echo   Option 1  -  16:9   (widescreen)
 echo   Option 2  -  9:16   (vertical / portrait)
 echo.
-echo   The red border follows your cursor.
+echo   The cyan border follows your cursor.
 echo   Press Esc in the overlay to quit.
 echo.
 set "CHOICE="
