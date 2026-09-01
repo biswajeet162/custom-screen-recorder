@@ -9,8 +9,8 @@ echo   ========================================
 echo    Cursor Border Overlay
 echo   ========================================
 echo.
-echo   Option 1  -  16:9   (widescreen)
-echo   Option 2  -  9:16   (vertical / portrait)
+echo   Option 1  -  16:9   (size set in cursor_border.py CONFIG)
+echo   Option 2  -  9:16   (size set in cursor_border.py CONFIG)
 echo.
 echo   The cyan border follows your cursor.
 echo   Press Esc in the overlay to quit.

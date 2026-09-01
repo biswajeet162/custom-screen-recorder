@@ -28,15 +28,33 @@ SWP_NOZORDER = 0x0004
 SWP_SHOWWINDOW = 0x0040
 GA_ROOT = 2
 
-# Line thickness of the cyan border (pixels)
-BORDER_WIDTH = 5
+# =============================================================================
+# CONFIG — edit width / height (pixels) for each option
+# =============================================================================
+
+# Option 1 — 16:9 (widescreen)  → chosen when you press 1 in run.bat
+# Sample sizes (width x height):
+#   640 x 360    |  854 x 480    |  1280 x 720   (HD)
+#   1600 x 900   |  1920 x 1080  (Full HD)       |  2560 x 1440  (QHD)
+OPTION1_WIDTH = 1280
+OPTION1_HEIGHT = 720
+
+# Option 2 — 9:16 (vertical / portrait)  → chosen when you press 2 in run.bat
+# Sample sizes (width x height):
+#   360 x 640    |  480 x 854    |  720 x 1280   (HD vertical)
+#   900 x 1600   |  1080 x 1920  (Full HD vertical) |  1440 x 2560  (QHD vertical)
+OPTION2_WIDTH = 720
+OPTION2_HEIGHT = 1280
+
+# Border look
+BORDER_WIDTH = 3          # line thickness in pixels
 BORDER_COLOR = "#00FFFF"  # cyan
+
+# =============================================================================
+
 # Chroma-key fill (made invisible by Windows layered color-key)
 KEY_COLOR = "#010101"
 KEY_COLORREF = 0x00010101  # 0x00bbggrr for RGB(1,1,1)
-
-# Outer frame size = this fraction of the primary work area
-FRAME_SCALE = 0.55
 UPDATE_MS = 8  # ~120 FPS — keeps cursor locked to box center
 
 
@@ -50,18 +68,11 @@ def get_cursor_pos() -> tuple[int, int]:
     return int(pt.x), int(pt.y)
 
 
-def primary_size() -> tuple[int, int]:
-    return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
-
-
-def frame_size(aspect_w: int, aspect_h: int, screen_w: int, screen_h: int, scale: float) -> tuple[int, int]:
-    """Box of the given aspect ratio within `scale` of the screen."""
-    max_w = int(screen_w * scale)
-    max_h = int(screen_h * scale)
-    by_width_h = max_w * aspect_h // aspect_w
-    if by_width_h <= max_h:
-        return max_w, by_width_h
-    return max_h * aspect_w // aspect_h, max_h
+def configured_size(ratio: str) -> tuple[int, int]:
+    """Return (width, height) from the CONFIG block for the chosen option."""
+    if ratio == "16:9":
+        return int(OPTION1_WIDTH), int(OPTION1_HEIGHT)
+    return int(OPTION2_WIDTH), int(OPTION2_HEIGHT)
 
 
 def get_hwnd(root: tk.Tk) -> int:
@@ -91,10 +102,16 @@ def parse_args() -> argparse.Namespace:
         help="Aspect ratio of the border",
     )
     parser.add_argument(
-        "--scale",
-        type=float,
-        default=FRAME_SCALE,
-        help=f"Frame size as fraction of screen (default {FRAME_SCALE})",
+        "--width",
+        type=int,
+        default=None,
+        help="Override frame width in pixels (otherwise uses CONFIG in this file)",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Override frame height in pixels (otherwise uses CONFIG in this file)",
     )
     parser.add_argument(
         "--border",
@@ -109,8 +126,8 @@ def ask_ratio_interactive() -> str:
     print()
     print("  Cursor Border Overlay")
     print("  ---------------------")
-    print("  1) 16:9  (widescreen)")
-    print("  2) 9:16  (vertical)")
+    print(f"  1) 16:9  (widescreen)  {OPTION1_WIDTH}x{OPTION1_HEIGHT}")
+    print(f"  2) 9:16  (vertical)    {OPTION2_WIDTH}x{OPTION2_HEIGHT}")
     print()
     while True:
         choice = input("  Choose option [1/2]: ").strip()
@@ -121,12 +138,13 @@ def ask_ratio_interactive() -> str:
         print("  Please enter 1 or 2.")
 
 
-def run(ratio: str, scale: float, border_w: int) -> None:
-    aw, ah = (16, 9) if ratio == "16:9" else (9, 16)
-    screen_w, screen_h = primary_size()
-    scale = max(0.15, min(0.95, scale))
+def run(ratio: str, border_w: int, width: int | None = None, height: int | None = None) -> None:
+    cfg_w, cfg_h = configured_size(ratio)
+    box_w = int(width) if width is not None else cfg_w
+    box_h = int(height) if height is not None else cfg_h
+    box_w = max(50, box_w)
+    box_h = max(50, box_h)
     border_w = max(2, min(30, border_w))
-    box_w, box_h = frame_size(aw, ah, screen_w, screen_h, scale)
 
     root = tk.Tk()
     root.title(f"Cursor Border {ratio}")
@@ -223,7 +241,7 @@ def main() -> int:
     args = parse_args()
     ratio = args.ratio or ask_ratio_interactive()
     try:
-        run(ratio, args.scale, args.border)
+        run(ratio, args.border, width=args.width, height=args.height)
     except KeyboardInterrupt:
         print("\nExiting.")
     return 0
