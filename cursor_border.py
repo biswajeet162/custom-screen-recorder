@@ -3,10 +3,10 @@ Cursor-centered aspect-ratio border overlay for Windows.
 
 Shows a setup prompt (quality, microphone, frame size) with a live cyan
 preview of the chosen size, then records the screen inside that rectangle
-with the chosen microphone. Press Ctrl+Shift together to park the border in place.
-Press Ctrl+Shift again to follow the pointer.
-Hold Ctrl+Caps Lock and press + to zoom in, or - to zoom out
-(aspect ratio stays 16:9 or 9:16). Press Esc to stop and save.
+with the chosen microphone. Press Ctrl+Caps Lock to park the border.
+Press Ctrl+Caps Lock again to follow the pointer.
+Hold Ctrl+Shift and + to zoom in, or - to zoom out (smooth, same ratio).
+Press Esc to stop and save.
 """
 
 from __future__ import annotations
@@ -93,17 +93,16 @@ OPTION2_HEIGHT = 1280
 # Border look
 BORDER_WIDTH = 3
 BORDER_COLOR = "#00FFFF"  # cyan
-BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl+Shift)
+BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl+Caps Lock)
 
 # =============================================================================
 
 KEY_COLOR = "#010101"
 KEY_COLORREF = 0x00010101  # 0x00bbggrr for RGB(1,1,1)
 UPDATE_MS = 8  # ~120 FPS — keeps cursor locked to box center
-ZOOM_STEP = 1.08
+ZOOM_RATE = 1.55  # size multiplier per second while + / - is held (smooth)
 ZOOM_MIN = 0.25
 ZOOM_MAX = 8.0
-ZOOM_REPEAT_S = 0.07
 
 
 class POINT(ctypes.Structure):
@@ -614,7 +613,7 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     q_row += 1
     ttk.Label(
         frm,
-        text="Ctrl+Shift parks. Ctrl+Caps Lock and + / - zooms (keeps 16:9 or 9:16). Esc saves.",
+        text="Ctrl+Caps Lock parks. Ctrl+Shift and hold + / - zooms smoothly. Esc saves.",
         foreground="#444444",
     ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
     q_row += 1
@@ -872,14 +871,12 @@ def run(
     root = overlay.win
     recorder: ScreenRecorder | None = None
     stopping = {"done": False}
-    follow = {"locked": False, "center": get_cursor_pos(), "combo_down": True}
+    follow = {"locked": False, "center": get_cursor_pos(), "park_down": True}
     zoom = {
         "level": 1.0,
         "base_w": box_w,
         "base_h": box_h,
-        "plus": False,
-        "minus": False,
-        "last": 0.0,
+        "clock": time.perf_counter(),
     }
 
     def get_frame() -> tuple[int, int, int, int]:
@@ -891,8 +888,8 @@ def run(
         cx, cy = follow["center"]
         follow["center"] = overlay.follow_center(int(cx), int(cy))
 
-    def apply_zoom(factor: float) -> None:
-        level = max(ZOOM_MIN, min(ZOOM_MAX, zoom["level"] * factor))
+    def set_zoom_level(level: float) -> None:
+        level = max(ZOOM_MIN, min(ZOOM_MAX, float(level)))
         w = even(max(64, round(zoom["base_w"] * level)))
         h = even(max(64, round(w * zoom["base_h"] / zoom["base_w"])))
         long_edge = max(w, h)
@@ -900,9 +897,9 @@ def run(
             scale = 8192 / long_edge
             w = even(max(64, round(w * scale)))
             h = even(max(64, round(h * scale)))
-        if (w, h) == (overlay.box_w, overlay.box_h) and level == zoom["level"]:
-            return
         zoom["level"] = level
+        if (w, h) == (overlay.box_w, overlay.box_h):
+            return
         overlay.set_size(w, h, fit_to_screen=False)
         place_overlay()
 
@@ -916,7 +913,7 @@ def run(
         follow["locked"] = not follow["locked"]
         if follow["locked"]:
             overlay.redraw(BORDER_COLOR_LOCKED)
-            print("  Border parked — pointer is free. Ctrl+Shift again to follow.")
+            print("  Border parked — pointer is free. Ctrl+Caps Lock again to follow.")
         else:
             overlay.redraw(BORDER_COLOR)
             print("  Border following the pointer again.")
@@ -960,23 +957,19 @@ def run(
             (user32.GetAsyncKeyState(VK_OEM_MINUS) & 0x8000)
             or (user32.GetAsyncKeyState(VK_SUBTRACT) & 0x8000)
         )
-        combo = ctrl_down and shift_down
-        if combo and not follow["combo_down"]:
+        combo = ctrl_down and caps_down
+        if combo and not follow["park_down"]:
             toggle_follow()
-        follow["combo_down"] = combo
+        follow["park_down"] = combo
 
-        zoom_mods = ctrl_down and caps_down and not shift_down
         now = time.perf_counter()
-        if zoom_mods and plus_down:
-            if (not zoom["plus"]) or (now - zoom["last"] >= ZOOM_REPEAT_S):
-                apply_zoom(ZOOM_STEP)
-                zoom["last"] = now
-        elif zoom_mods and minus_down:
-            if (not zoom["minus"]) or (now - zoom["last"] >= ZOOM_REPEAT_S):
-                apply_zoom(1.0 / ZOOM_STEP)
-                zoom["last"] = now
-        zoom["plus"] = plus_down
-        zoom["minus"] = minus_down
+        dt = max(0.0, min(0.05, now - zoom["clock"]))
+        zoom["clock"] = now
+        zoom_mods = ctrl_down and shift_down and not caps_down
+        if zoom_mods and plus_down and not minus_down:
+            set_zoom_level(zoom["level"] * (ZOOM_RATE ** dt))
+        elif zoom_mods and minus_down and not plus_down:
+            set_zoom_level(zoom["level"] * ((1.0 / ZOOM_RATE) ** dt))
 
         move_to_cursor()
         try:
@@ -1005,8 +998,8 @@ def run(
         out = default_output_path(ratio, quality, box_w, box_h)
         print(f"  File: {out}")
         print("  Cyan border = captured area (cursor stays in the center).")
-        print("  Press Ctrl+Shift to park. Ctrl+Shift again to follow.")
-        print("  Hold Ctrl+Caps Lock and + to zoom in, - to zoom out (ratio stays locked).")
+        print("  Press Ctrl+Caps Lock to park. Press it again to follow.")
+        print("  Hold Ctrl+Shift and + to zoom in, - to zoom out (smooth, ratio locked).")
         print("  Press Esc to stop and save.")
         recorder = ScreenRecorder(
             width=box_w,
@@ -1028,7 +1021,7 @@ def run(
             return
     else:
         print(f"  Overlay only: {ratio}   {box_w}x{box_h}")
-        print("  Press Ctrl+Shift to park. Ctrl+Caps Lock and + / - to zoom.")
+        print("  Press Ctrl+Caps Lock to park. Ctrl+Shift and + / - to zoom.")
         print("  Press Esc to quit.")
 
     root.protocol("WM_DELETE_WINDOW", finish)
