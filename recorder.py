@@ -159,7 +159,7 @@ class ScreenRecorder:
         mic_name: str | None,
         audio_bitrate: str,
         output_path: Path,
-        get_cursor_pos,
+        get_frame,
     ) -> None:
         self.width = even(max(50, width))
         self.height = even(max(50, height))
@@ -169,7 +169,7 @@ class ScreenRecorder:
         self.mic_name = mic_name or None
         self.audio_bitrate = audio_bitrate
         self.output_path = Path(output_path)
-        self.get_cursor_pos = get_cursor_pos
+        self.get_frame = get_frame
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -311,8 +311,8 @@ class ScreenRecorder:
 
         interval = 1.0 / float(self.fps)
         next_t = time.perf_counter()
-        canvas = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        w, h = self.width, self.height
+        out_frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        grab_buf = np.zeros((self.height, self.width, 3), dtype=np.uint8)
 
         try:
             with mss.mss() as sct:
@@ -321,7 +321,6 @@ class ScreenRecorder:
                 virt_t = int(virt["top"])
                 virt_r = virt_l + int(virt["width"])
                 virt_b = virt_t + int(virt["height"])
-                # Warm up GDI capture so the first recorded seconds are not dropped
                 try:
                     sct.grab(virt)
                 except Exception:
@@ -334,12 +333,22 @@ class ScreenRecorder:
                         continue
                     while next_t < now - interval:
                         next_t += interval
-                    cx, cy = self.get_cursor_pos()
-                    x = int(cx) - (w // 2)
-                    y = int(cy) - (h // 2)
-                    frame = _grab_padded(sct, canvas, x, y, w, h, virt_l, virt_t, virt_r, virt_b)
+                    cx, cy, cap_w, cap_h = self.get_frame()
+                    cap_w = even(max(64, int(cap_w)))
+                    cap_h = even(max(64, int(cap_h)))
+                    if grab_buf.shape[0] != cap_h or grab_buf.shape[1] != cap_w:
+                        grab_buf = np.zeros((cap_h, cap_w, 3), dtype=np.uint8)
+                    x = int(cx) - (cap_w // 2)
+                    y = int(cy) - (cap_h // 2)
+                    captured = _grab_padded(
+                        sct, grab_buf, x, y, cap_w, cap_h, virt_l, virt_t, virt_r, virt_b
+                    )
+                    if cap_w == self.width and cap_h == self.height:
+                        frame = captured
+                    else:
+                        frame = _resize_bgr(captured, out_frame)
                     try:
-                        stdin.write(frame.tobytes())
+                        stdin.write(np.ascontiguousarray(frame).tobytes())
                     except (BrokenPipeError, OSError) as exc:
                         self._error = str(exc)
                         break
@@ -389,6 +398,23 @@ def _grab_padded(
     canvas.fill(0)
     canvas[dest_y : dest_y + sh, dest_x : dest_x + sw, :] = shot[:, :, :3]
     return canvas
+
+
+def _resize_bgr(src, dst):
+    """Nearest-neighbor resize into dst (H, W, 3), keeping the output aspect ratio."""
+    import numpy as np
+
+    nh, nw = dst.shape[0], dst.shape[1]
+    h, w = src.shape[0], src.shape[1]
+    if h == nh and w == nw:
+        dst[:, :, :] = src
+        return dst
+    ys = (np.arange(nh) * (h / nh)).astype(np.intp)
+    xs = (np.arange(nw) * (w / nw)).astype(np.intp)
+    np.clip(ys, 0, h - 1, out=ys)
+    np.clip(xs, 0, w - 1, out=xs)
+    dst[:, :, :] = src[ys[:, None], xs]
+    return dst
 
 
 def ensure_recording_deps() -> None:

@@ -14,10 +14,11 @@ echo     1. Video quality   (Low / HD / 2K)
 echo     2. Microphone
 echo     3. Frame size      (16:9 / 9:16 / custom)
 echo.
-echo   The cyan box always stays fully on this screen.
+echo   The cyan box stays on screen until you zoom in.
 echo   Pick 16:9, 9:16, or custom to see that size immediately.
 echo   Press Ctrl+Shift to park the border (stops following).
-echo   Press Ctrl+Shift again to follow the pointer.
+echo   Hold Ctrl + Caps Lock + Plus to zoom in (can leave the screen).
+echo   Hold Ctrl + Caps Lock + Minus to zoom out. Ratio stays locked.
 echo   Press Esc to stop and save (folder: recordings).
 echo.
 

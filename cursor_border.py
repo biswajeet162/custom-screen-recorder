@@ -4,7 +4,9 @@ Cursor-centered aspect-ratio border overlay for Windows.
 Shows a setup prompt (quality, microphone, frame size) with a live cyan
 preview of the chosen size, then records the screen inside that rectangle
 with the chosen microphone. Press Ctrl+Shift together to park the border in place.
-Press Ctrl+Shift again to follow the pointer. Press Esc to stop and save.
+Press Ctrl+Shift again to follow the pointer.
+Hold Ctrl+Caps Lock and press + to zoom in, or - to zoom out
+(aspect ratio stays 16:9 or 9:16). Press Esc to stop and save.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import sys
+import time
 from ctypes import wintypes
 
 # Must run before tkinter / mss create windows, or Windows will stretch the
@@ -56,6 +59,11 @@ LWA_COLORKEY = 0x00000001
 VK_ESCAPE = 0x1B
 VK_CONTROL = 0x11
 VK_SHIFT = 0x10
+VK_CAPITAL = 0x14
+VK_OEM_PLUS = 0xBB
+VK_OEM_MINUS = 0xBD
+VK_ADD = 0x6B
+VK_SUBTRACT = 0x6D
 MONITOR_DEFAULTTONEAREST = 2
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -92,6 +100,10 @@ BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl+Shift)
 KEY_COLOR = "#010101"
 KEY_COLORREF = 0x00010101  # 0x00bbggrr for RGB(1,1,1)
 UPDATE_MS = 8  # ~120 FPS — keeps cursor locked to box center
+ZOOM_STEP = 1.08
+ZOOM_MIN = 0.25
+ZOOM_MAX = 8.0
+ZOOM_REPEAT_S = 0.07
 
 
 class POINT(ctypes.Structure):
@@ -320,8 +332,12 @@ class CyanBorder:
                 tags="sizelabel",
             )
 
-    def set_size(self, box_w: int, box_h: int) -> None:
-        self.box_w, self.box_h = screen_fit(box_w, box_h)
+    def set_size(self, box_w: int, box_h: int, *, fit_to_screen: bool = True) -> None:
+        if fit_to_screen:
+            self.box_w, self.box_h = screen_fit(box_w, box_h)
+        else:
+            self.box_w = even(max(64, box_w))
+            self.box_h = even(max(64, box_h))
         self.canvas.config(width=self.box_w, height=self.box_h)
         self._apply_pixel_size()
         self.win.geometry(f"{self.box_w}x{self.box_h}")
@@ -344,12 +360,17 @@ class CyanBorder:
             )
         self.win.geometry(f"+{x}+{y}")
 
-    def follow_center(self, cx: int, cy: int) -> tuple[int, int]:
-        """Place the box around (cx, cy), clamped so every side stays on this monitor."""
-        rect = monitor_rect_at(cx, cy)
+    def follow_center(self, cx: int, cy: int, *, stay_on_screen: bool | None = None) -> tuple[int, int]:
+        """Place the box around (cx, cy). Clamps only while the box still fits on the monitor."""
         x = cx - (self.box_w // 2)
         y = cy - (self.box_h // 2)
-        x, y = clamp_top_left(x, y, self.box_w, self.box_h, rect)
+        rect = monitor_rect_at(cx, cy)
+        mon_w = rect[2] - rect[0]
+        mon_h = rect[3] - rect[1]
+        if stay_on_screen is None:
+            stay_on_screen = self.box_w <= mon_w and self.box_h <= mon_h
+        if stay_on_screen:
+            x, y = clamp_top_left(x, y, self.box_w, self.box_h, rect)
         self.move_top_left(x, y)
         return x + (self.box_w // 2), y + (self.box_h // 2)
 
@@ -593,7 +614,7 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     q_row += 1
     ttk.Label(
         frm,
-        text="The cyan box stays fully on this screen. Ctrl+Shift parks it. Esc saves after start.",
+        text="Ctrl+Shift parks. Ctrl+Caps Lock and + / - zooms (keeps 16:9 or 9:16). Esc saves.",
         foreground="#444444",
     ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
     q_row += 1
@@ -852,11 +873,38 @@ def run(
     recorder: ScreenRecorder | None = None
     stopping = {"done": False}
     follow = {"locked": False, "center": get_cursor_pos(), "combo_down": True}
+    zoom = {
+        "level": 1.0,
+        "base_w": box_w,
+        "base_h": box_h,
+        "plus": False,
+        "minus": False,
+        "last": 0.0,
+    }
 
-    def get_frame_center() -> tuple[int, int]:
-        """Center of the framed region — frozen while Ctrl+Shift-parked."""
+    def get_frame() -> tuple[int, int, int, int]:
+        """Center + current capture size (grows/shrinks with zoom, aspect locked)."""
         cx, cy = follow["center"]
-        return int(cx), int(cy)
+        return int(cx), int(cy), overlay.box_w, overlay.box_h
+
+    def place_overlay() -> None:
+        cx, cy = follow["center"]
+        follow["center"] = overlay.follow_center(int(cx), int(cy))
+
+    def apply_zoom(factor: float) -> None:
+        level = max(ZOOM_MIN, min(ZOOM_MAX, zoom["level"] * factor))
+        w = even(max(64, round(zoom["base_w"] * level)))
+        h = even(max(64, round(w * zoom["base_h"] / zoom["base_w"])))
+        long_edge = max(w, h)
+        if long_edge > 8192:
+            scale = 8192 / long_edge
+            w = even(max(64, round(w * scale)))
+            h = even(max(64, round(h * scale)))
+        if (w, h) == (overlay.box_w, overlay.box_h) and level == zoom["level"]:
+            return
+        zoom["level"] = level
+        overlay.set_size(w, h, fit_to_screen=False)
+        place_overlay()
 
     def move_to_cursor() -> None:
         if follow["locked"]:
@@ -903,10 +951,33 @@ def run(
             return
         ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
         shift_down = bool(user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+        caps_down = bool(user32.GetAsyncKeyState(VK_CAPITAL) & 0x8000)
+        plus_down = bool(
+            (user32.GetAsyncKeyState(VK_OEM_PLUS) & 0x8000)
+            or (user32.GetAsyncKeyState(VK_ADD) & 0x8000)
+        )
+        minus_down = bool(
+            (user32.GetAsyncKeyState(VK_OEM_MINUS) & 0x8000)
+            or (user32.GetAsyncKeyState(VK_SUBTRACT) & 0x8000)
+        )
         combo = ctrl_down and shift_down
         if combo and not follow["combo_down"]:
             toggle_follow()
         follow["combo_down"] = combo
+
+        zoom_mods = ctrl_down and caps_down and not shift_down
+        now = time.perf_counter()
+        if zoom_mods and plus_down:
+            if (not zoom["plus"]) or (now - zoom["last"] >= ZOOM_REPEAT_S):
+                apply_zoom(ZOOM_STEP)
+                zoom["last"] = now
+        elif zoom_mods and minus_down:
+            if (not zoom["minus"]) or (now - zoom["last"] >= ZOOM_REPEAT_S):
+                apply_zoom(1.0 / ZOOM_STEP)
+                zoom["last"] = now
+        zoom["plus"] = plus_down
+        zoom["minus"] = minus_down
+
         move_to_cursor()
         try:
             root.after(UPDATE_MS, tick)
@@ -934,7 +1005,8 @@ def run(
         out = default_output_path(ratio, quality, box_w, box_h)
         print(f"  File: {out}")
         print("  Cyan border = captured area (cursor stays in the center).")
-        print("  Press Ctrl+Shift to park the border. Ctrl+Shift again to follow.")
+        print("  Press Ctrl+Shift to park. Ctrl+Shift again to follow.")
+        print("  Hold Ctrl+Caps Lock and + to zoom in, - to zoom out (ratio stays locked).")
         print("  Press Esc to stop and save.")
         recorder = ScreenRecorder(
             width=box_w,
@@ -945,7 +1017,7 @@ def run(
             mic_name=mic_name,
             audio_bitrate=str(q["audio_bitrate"]),
             output_path=out,
-            get_cursor_pos=get_frame_center,
+            get_frame=get_frame,
         )
         assert ffmpeg is not None
         try:
@@ -956,7 +1028,7 @@ def run(
             return
     else:
         print(f"  Overlay only: {ratio}   {box_w}x{box_h}")
-        print("  Press Ctrl+Shift to park the border. Ctrl+Shift again to follow.")
+        print("  Press Ctrl+Shift to park. Ctrl+Caps Lock and + / - to zoom.")
         print("  Press Esc to quit.")
 
     root.protocol("WM_DELETE_WINDOW", finish)
