@@ -3,8 +3,8 @@ Cursor-centered aspect-ratio border overlay for Windows.
 
 Shows a setup prompt (quality, microphone, frame size) with a live cyan
 preview of the chosen size, then records the screen inside that rectangle
-with the chosen microphone. Press Ctrl to park the border in place.
-Press Ctrl again to follow the pointer. Press Esc to stop and save.
+with the chosen microphone. Press Ctrl+Shift together to park the border in place.
+Press Ctrl+Shift again to follow the pointer. Press Esc to stop and save.
 """
 
 from __future__ import annotations
@@ -38,6 +38,12 @@ WS_EX_TOOLWINDOW = 0x00000080
 LWA_COLORKEY = 0x00000001
 VK_ESCAPE = 0x1B
 VK_CONTROL = 0x11
+VK_SHIFT = 0x10
+MONITOR_DEFAULTTONEAREST = 2
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
 HWND_TOPMOST = -1
 SWP_NOACTIVATE = 0x0010
 SWP_NOSIZE = 0x0001
@@ -62,7 +68,7 @@ OPTION2_HEIGHT = 1280
 # Border look
 BORDER_WIDTH = 3
 BORDER_COLOR = "#00FFFF"  # cyan
-BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl)
+BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl+Shift)
 
 # =============================================================================
 
@@ -75,10 +81,94 @@ class POINT(ctypes.Structure):
     _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
 
 
+class RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", wintypes.LONG),
+        ("top", wintypes.LONG),
+        ("right", wintypes.LONG),
+        ("bottom", wintypes.LONG),
+    ]
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+user32.MonitorFromPoint.argtypes = [POINT, wintypes.DWORD]
+user32.MonitorFromPoint.restype = wintypes.HANDLE
+user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+
 def get_cursor_pos() -> tuple[int, int]:
     pt = POINT()
     user32.GetCursorPos(ctypes.byref(pt))
     return int(pt.x), int(pt.y)
+
+
+def virtual_screen_rect() -> tuple[int, int, int, int]:
+    left = int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
+    top = int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
+    width = int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+    height = int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+    return left, top, left + width, top + height
+
+
+def monitor_rect_at(x: int, y: int) -> tuple[int, int, int, int]:
+    """Pixel bounds of the display that contains (x, y)."""
+    pt = POINT(int(x), int(y))
+    handle = user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+    if not handle:
+        return virtual_screen_rect()
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(handle, ctypes.byref(info)):
+        return virtual_screen_rect()
+    r = info.rcMonitor
+    return int(r.left), int(r.top), int(r.right), int(r.bottom)
+
+
+def fit_size_to_rect(w: int, h: int, rect: tuple[int, int, int, int]) -> tuple[int, int]:
+    """Shrink w×h to fit inside rect, keeping aspect ratio. Never upscale."""
+    left, top, right, bottom = rect
+    max_w = max(64, right - left)
+    max_h = max(64, bottom - top)
+    w = max(64, int(w))
+    h = max(64, int(h))
+    if w <= max_w and h <= max_h:
+        return even(w), even(h)
+    scale = min(max_w / w, max_h / h)
+    return even(max(64, int(w * scale))), even(max(64, int(h * scale)))
+
+
+def screen_fit(w: int, h: int, x: int | None = None, y: int | None = None) -> tuple[int, int]:
+    """Fit a frame to the monitor under the cursor (or a given point)."""
+    if x is None or y is None:
+        x, y = get_cursor_pos()
+    return fit_size_to_rect(w, h, monitor_rect_at(x, y))
+
+
+def clamp_top_left(
+    x: int, y: int, w: int, h: int, rect: tuple[int, int, int, int]
+) -> tuple[int, int]:
+    """Keep the whole w×h box inside rect so all four sides stay on that screen."""
+    left, top, right, bottom = rect
+    max_x = right - w
+    max_y = bottom - h
+    if max_x < left:
+        x = left
+    else:
+        x = min(max(int(x), left), max_x)
+    if max_y < top:
+        y = top
+    else:
+        y = min(max(int(y), top), max_y)
+    return int(x), int(y)
 
 
 def configured_size(ratio: str) -> tuple[int, int]:
@@ -128,8 +218,7 @@ class CyanBorder:
     ) -> None:
         self.border_w = max(2, min(30, int(border_w)))
         self.show_label = show_label
-        self.box_w = even(max(50, box_w))
-        self.box_h = even(max(50, box_h))
+        self.box_w, self.box_h = screen_fit(box_w, box_h)
         self.hwnd = 0
         self.last_pos: tuple[int, int] | None = None
         self.color = BORDER_COLOR
@@ -178,8 +267,7 @@ class CyanBorder:
             )
 
     def set_size(self, box_w: int, box_h: int) -> None:
-        self.box_w = even(max(50, box_w))
-        self.box_h = even(max(50, box_h))
+        self.box_w, self.box_h = screen_fit(box_w, box_h)
         self.canvas.config(width=self.box_w, height=self.box_h)
         if self.hwnd:
             user32.SetWindowPos(
@@ -211,13 +299,22 @@ class CyanBorder:
             )
         self.win.geometry(f"+{x}+{y}")
 
-    def follow_center(self, cx: int, cy: int) -> None:
-        self.move_top_left(cx - (self.box_w // 2), cy - (self.box_h // 2))
+    def follow_center(self, cx: int, cy: int) -> tuple[int, int]:
+        """Place the box around (cx, cy), clamped so every side stays on this monitor."""
+        rect = monitor_rect_at(cx, cy)
+        x = cx - (self.box_w // 2)
+        y = cy - (self.box_h // 2)
+        x, y = clamp_top_left(x, y, self.box_w, self.box_h, rect)
+        self.move_top_left(x, y)
+        return x + (self.box_w // 2), y + (self.box_h // 2)
 
     def center_on_screen(self) -> None:
-        sw = int(self.win.winfo_screenwidth())
-        sh = int(self.win.winfo_screenheight())
-        self.move_top_left((sw - self.box_w) // 2, (sh - self.box_h) // 2)
+        cx, cy = get_cursor_pos()
+        left, top, right, bottom = monitor_rect_at(cx, cy)
+        x = (left + right - self.box_w) // 2
+        y = (top + bottom - self.box_h) // 2
+        x, y = clamp_top_left(x, y, self.box_w, self.box_h, (left, top, right, bottom))
+        self.move_top_left(x, y)
 
     def lift_behind(self, other: tk.Misc) -> None:
         """Keep the setup dialog visually above this preview."""
@@ -335,16 +432,23 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
         q = quality_var.get()
         if ratio == "custom":
             try:
-                return even(int(custom_w.get())), even(int(custom_h.get()))
+                raw_w, raw_h = even(int(custom_w.get())), even(int(custom_h.get()))
             except ValueError:
                 return 0, 0
-        return size_for_quality(ratio, q)
+            if raw_w < 64 or raw_h < 64:
+                return raw_w, raw_h
+            return screen_fit(raw_w, raw_h)
+        return screen_fit(*size_for_quality(ratio, q))
 
     def refresh_size_labels() -> None:
-        w16, h16 = size_for_quality("16:9", quality_var.get())
-        w916, h916 = size_for_quality("9:16", quality_var.get())
-        radio_169.config(text=f"16:9 widescreen   {w16} × {h16}")
-        radio_916.config(text=f"9:16 vertical     {w916} × {h916}")
+        raw16 = size_for_quality("16:9", quality_var.get())
+        raw916 = size_for_quality("9:16", quality_var.get())
+        w16, h16 = screen_fit(*raw16)
+        w916, h916 = screen_fit(*raw916)
+        fit16 = "" if (w16, h16) == raw16 else "  (fits screen)"
+        fit916 = "" if (w916, h916) == raw916 else "  (fits screen)"
+        radio_169.config(text=f"16:9 widescreen   {w16} × {h16}{fit16}")
+        radio_916.config(text=f"9:16 vertical     {w916} × {h916}{fit916}")
         if ratio_var.get() != "custom":
             w, h = current_size_for(ratio_var.get())
             custom_w.set(str(w))
@@ -353,7 +457,7 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
         w_now, h_now = current_size_for(ratio_var.get())
         if w_now >= 64 and h_now >= 64:
             size_note.set(
-                f"Now showing  {w_now} × {h_now} px  — the cyan box is that window.  "
+                f"Now showing  {w_now} × {h_now} px  — stays fully on this screen.  "
                 f"{q['fps']} fps ({q['label']})"
             )
         else:
@@ -444,7 +548,7 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     q_row += 1
     ttk.Label(
         frm,
-        text="The cyan box on your screen is the live size. Ctrl parks it. Esc saves after start.",
+        text="The cyan box stays fully on this screen. Ctrl+Shift parks it. Esc saves after start.",
         foreground="#444444",
     ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
     q_row += 1
@@ -466,9 +570,10 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
             if width > 7680 or height > 7680:
                 messagebox.showerror("Invalid size", "Custom size must be 7680 × 7680 or smaller.")
                 return
+            width, height = screen_fit(width, height)
             ratio_label = f"{width}:{height}"
         else:
-            width, height = size_for_quality(ratio, quality)
+            width, height = screen_fit(*size_for_quality(ratio, quality))
             ratio_label = ratio
 
         display = mic_display.get()
@@ -589,9 +694,9 @@ def ask_setup_cli(mics: list[str]) -> dict | None:
         input("  Press Enter to continue...")
 
     print()
-    w16, h16 = size_for_quality("16:9", quality)
-    w916, h916 = size_for_quality("9:16", quality)
-    print("  Frame size (the following border)")
+    w16, h16 = screen_fit(*size_for_quality("16:9", quality))
+    w916, h916 = screen_fit(*size_for_quality("9:16", quality))
+    print("  Frame size (the following border — fitted to this screen)")
     print(f"    1) 16:9  widescreen  {w16}x{h16}")
     print(f"    2) 9:16  vertical    {w916}x{h916}")
     print("    3) Custom width x height")
@@ -614,6 +719,7 @@ def ask_setup_cli(mics: list[str]) -> dict | None:
             if width < 64 or height < 64:
                 print("  Size must be at least 64x64.")
                 continue
+            width, height = screen_fit(width, height)
             ratio = f"{width}:{height}"
             break
         print("  Please enter 1, 2, or 3.")
@@ -635,10 +741,10 @@ def resolve_session(args: argparse.Namespace, mics: list[str]) -> dict | None:
     if overlay_only:
         ratio = args.ratio or "16:9"
         if args.width and args.height:
-            width, height = even(args.width), even(args.height)
+            width, height = screen_fit(even(args.width), even(args.height))
             ratio = f"{width}:{height}"
         else:
-            width, height = configured_size(ratio)
+            width, height = screen_fit(*configured_size(ratio))
         return {
             "quality": args.quality or "hd",
             "ratio": ratio,
@@ -651,11 +757,11 @@ def resolve_session(args: argparse.Namespace, mics: list[str]) -> dict | None:
     if fully_specified:
         quality = args.quality or "hd"
         if args.width and args.height:
-            width, height = even(args.width), even(args.height)
+            width, height = screen_fit(even(args.width), even(args.height))
             ratio = f"{width}:{height}"
         else:
             ratio = args.ratio or "16:9"
-            width, height = size_for_quality(ratio, quality)
+            width, height = screen_fit(*size_for_quality(ratio, quality))
         mic_name: str | None
         if args.mic is None:
             mic_name = preferred_microphone(mics)
@@ -693,34 +799,31 @@ def run(
     mic_name: str | None,
     ffmpeg: str | None,
 ) -> None:
-    box_w = even(max(50, int(width)))
-    box_h = even(max(50, int(height)))
+    box_w, box_h = screen_fit(max(50, int(width)), max(50, int(height)))
     border_w = max(2, min(30, int(border_w)))
 
     overlay = CyanBorder(None, box_w, box_h, border_w, show_label=False)
     root = overlay.win
     recorder: ScreenRecorder | None = None
     stopping = {"done": False}
-    follow = {"locked": False, "center": get_cursor_pos(), "ctrl_down": True}
+    follow = {"locked": False, "center": get_cursor_pos(), "combo_down": True}
 
     def get_frame_center() -> tuple[int, int]:
-        """Center of the framed region — frozen while Ctrl-parked."""
+        """Center of the framed region — frozen while Ctrl+Shift-parked."""
         cx, cy = follow["center"]
         return int(cx), int(cy)
 
     def move_to_cursor() -> None:
         if follow["locked"]:
-            cx, cy = follow["center"]
-        else:
-            cx, cy = get_cursor_pos()
-            follow["center"] = (cx, cy)
-        overlay.follow_center(int(cx), int(cy))
+            return
+        cx, cy = get_cursor_pos()
+        follow["center"] = overlay.follow_center(int(cx), int(cy))
 
     def toggle_follow() -> None:
         follow["locked"] = not follow["locked"]
         if follow["locked"]:
             overlay.redraw(BORDER_COLOR_LOCKED)
-            print("  Border parked — pointer is free. Ctrl again to follow.")
+            print("  Border parked — pointer is free. Ctrl+Shift again to follow.")
         else:
             overlay.redraw(BORDER_COLOR)
             print("  Border following the pointer again.")
@@ -754,9 +857,11 @@ def run(
             finish()
             return
         ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
-        if ctrl_down and not follow["ctrl_down"]:
+        shift_down = bool(user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
+        combo = ctrl_down and shift_down
+        if combo and not follow["combo_down"]:
             toggle_follow()
-        follow["ctrl_down"] = ctrl_down
+        follow["combo_down"] = combo
         move_to_cursor()
         try:
             root.after(UPDATE_MS, tick)
@@ -784,7 +889,7 @@ def run(
         out = default_output_path(ratio, quality, box_w, box_h)
         print(f"  File: {out}")
         print("  Cyan border = captured area (cursor stays in the center).")
-        print("  Press Ctrl to park the border. Ctrl again to follow.")
+        print("  Press Ctrl+Shift to park the border. Ctrl+Shift again to follow.")
         print("  Press Esc to stop and save.")
         recorder = ScreenRecorder(
             width=box_w,
@@ -806,7 +911,7 @@ def run(
             return
     else:
         print(f"  Overlay only: {ratio}   {box_w}x{box_h}")
-        print("  Press Ctrl to park the border. Ctrl again to follow.")
+        print("  Press Ctrl+Shift to park the border. Ctrl+Shift again to follow.")
         print("  Press Esc to quit.")
 
     root.protocol("WM_DELETE_WINDOW", finish)
