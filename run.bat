@@ -16,6 +16,8 @@ echo     3. Frame size      (16:9 / 9:16 / custom)
 echo.
 echo   The red border follows your cursor.
 echo   Everything inside it is recorded, with voice.
+echo   Press Ctrl to park the border (stops following).
+echo   Press Ctrl again to follow the pointer.
 echo   Press Esc to stop and save (folder: recordings).
 echo.
 

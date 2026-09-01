@@ -3,7 +3,8 @@ Cursor-centered aspect-ratio border overlay for Windows.
 
 Shows a setup prompt (quality, microphone, frame size), then a red rectangle
 that follows the mouse. The screen inside that rectangle is recorded to MP4
-with the chosen microphone. Press Esc to stop and save.
+with the chosen microphone. Press Ctrl to park the border in place.
+Press Ctrl again to follow the pointer. Press Esc to stop and save.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 LWA_COLORKEY = 0x00000001
 VK_ESCAPE = 0x1B
+VK_CONTROL = 0x11
 HWND_TOPMOST = -1
 SWP_NOACTIVATE = 0x0010
 SWP_NOSIZE = 0x0001
@@ -59,8 +61,9 @@ OPTION2_HEIGHT = 1280
 
 # Border look
 BORDER_WIDTH = 3
-BORDER_COLOR = "#FF2B2B"  # red while recording
+BORDER_COLOR = "#FF2B2B"  # red while recording and following
 BORDER_COLOR_IDLE = "#00FFFF"  # cyan when overlay-only
+BORDER_COLOR_LOCKED = "#FFD000"  # gold when parked (Ctrl)
 
 # =============================================================================
 
@@ -300,8 +303,14 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     q_row += 1
 
     ttk.Label(frm, textvariable=size_note, foreground="#444444").grid(
-        row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 4)
+        row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 2)
     )
+    q_row += 1
+    ttk.Label(
+        frm,
+        text="Ctrl parks the border so it stops following the pointer. Ctrl again resumes. Esc saves.",
+        foreground="#444444",
+    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
     q_row += 1
 
     def start() -> None:
@@ -541,19 +550,34 @@ def run(
     canvas.pack(fill="both", expand=True)
 
     bw = border_w
-    canvas.create_rectangle(0, 0, win_w, bw, fill=rec_color, outline="")
-    canvas.create_rectangle(0, win_h - bw, win_w, win_h, fill=rec_color, outline="")
-    canvas.create_rectangle(0, 0, bw, win_h, fill=rec_color, outline="")
-    canvas.create_rectangle(win_w - bw, 0, win_w, win_h, fill=rec_color, outline="")
+    bars = (
+        canvas.create_rectangle(0, 0, win_w, bw, fill=rec_color, outline=""),
+        canvas.create_rectangle(0, win_h - bw, win_w, win_h, fill=rec_color, outline=""),
+        canvas.create_rectangle(0, 0, bw, win_h, fill=rec_color, outline=""),
+        canvas.create_rectangle(win_w - bw, 0, win_w, win_h, fill=rec_color, outline=""),
+    )
 
     hwnd_holder: dict[str, int] = {"hwnd": 0}
     last_pos: dict[str, tuple[int, int] | None] = {"xy": None}
     recorder: ScreenRecorder | None = None
     stopping = {"done": False}
+    follow = {"locked": False, "center": get_cursor_pos(), "ctrl_down": True}
+
+    def paint_border(color: str) -> None:
+        for item in bars:
+            canvas.itemconfig(item, fill=color)
+
+    def get_frame_center() -> tuple[int, int]:
+        """Center of the framed region — frozen while Ctrl-parked."""
+        return follow["center"]
 
     def move_to_cursor() -> None:
         """Place the box so the live cursor sits exactly at its content center."""
-        cx, cy = get_cursor_pos()
+        if follow["locked"]:
+            cx, cy = follow["center"]
+        else:
+            cx, cy = get_cursor_pos()
+            follow["center"] = (cx, cy)
         x = cx - (box_w // 2) - bw
         y = cy - (box_h // 2) - bw
         if last_pos["xy"] == (x, y):
@@ -572,6 +596,15 @@ def run(
                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
             )
         root.geometry(f"+{x}+{y}")
+
+    def toggle_follow() -> None:
+        follow["locked"] = not follow["locked"]
+        if follow["locked"]:
+            paint_border(BORDER_COLOR_LOCKED)
+            print("  Border parked — pointer is free. Ctrl again to follow.")
+        else:
+            paint_border(rec_color)
+            print("  Border following the pointer again.")
 
     def finish() -> None:
         if stopping["done"]:
@@ -604,6 +637,10 @@ def run(
         if user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000:
             finish()
             return
+        ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+        if ctrl_down and not follow["ctrl_down"]:
+            toggle_follow()
+        follow["ctrl_down"] = ctrl_down
         move_to_cursor()
         root.after(UPDATE_MS, tick)
 
@@ -638,6 +675,7 @@ def run(
         out = default_output_path(ratio, quality, box_w, box_h)
         print(f"  File: {out}")
         print("  Red border = captured area (cursor stays in the center).")
+        print("  Press Ctrl to park the border (gold). Ctrl again to follow.")
         print("  Press Esc to stop and save.")
         recorder = ScreenRecorder(
             width=box_w,
@@ -648,7 +686,7 @@ def run(
             mic_name=mic_name,
             audio_bitrate=str(q["audio_bitrate"]),
             output_path=out,
-            get_cursor_pos=get_cursor_pos,
+            get_cursor_pos=get_frame_center,
         )
         assert ffmpeg is not None
         try:
@@ -662,6 +700,7 @@ def run(
             return
     else:
         print(f"  Overlay only: {ratio}   {box_w}x{box_h}")
+        print("  Press Ctrl to park the border. Ctrl again to follow.")
         print("  Press Esc to quit.")
 
     root.protocol("WM_DELETE_WINDOW", finish)
