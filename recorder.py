@@ -4,6 +4,7 @@ Cursor-following screen recorder: captures the framed region and mic audio via f
 
 from __future__ import annotations
 
+import queue
 import re
 import shutil
 import subprocess
@@ -17,13 +18,13 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
 
-# Quality: output size comes from aspect ratio; these set fps / encode / audio.
+# Quality: output size comes from aspect ratio; fps is chosen separately.
 QUALITY_PRESETS: dict[str, dict] = {
     "low": {
         "key": "low",
         "label": "Low",
-        "detail": "720p, 24 fps — smaller file",
-        "fps": 24,
+        "detail": "720p — smaller file",
+        "fps": 30,
         "crf": 28,
         "preset": "veryfast",
         "audio_bitrate": "128k",
@@ -32,7 +33,7 @@ QUALITY_PRESETS: dict[str, dict] = {
     "hd": {
         "key": "hd",
         "label": "HD",
-        "detail": "1080p, 30 fps — recommended",
+        "detail": "1080p — recommended",
         "fps": 30,
         "crf": 21,
         "preset": "veryfast",
@@ -42,16 +43,28 @@ QUALITY_PRESETS: dict[str, dict] = {
     "2k": {
         "key": "2k",
         "label": "2K",
-        "detail": "1440p, 30 fps — extra detail",
+        "detail": "1440p — extra detail",
         "fps": 30,
         "crf": 18,
         "preset": "veryfast",
         "audio_bitrate": "192k",
         "height_16_9": 1440,
     },
+    "4k": {
+        "key": "4k",
+        "label": "4K",
+        "detail": "2160p — maximum detail (upscaled if the screen is smaller)",
+        "fps": 30,
+        "crf": 20,
+        "preset": "veryfast",
+        "audio_bitrate": "192k",
+        "height_16_9": 2160,
+    },
 }
 
-_HEIGHT_TO_WIDTH_16_9 = {720: 1280, 1080: 1920, 1440: 2560}
+FPS_CHOICES = (24, 30, 60)
+
+_HEIGHT_TO_WIDTH_16_9 = {720: 1280, 1080: 1920, 1440: 2560, 2160: 3840}
 
 NO_AUDIO = "__none__"
 
@@ -70,6 +83,13 @@ def size_for_quality(ratio: str, quality: str) -> tuple[int, int]:
     if ratio == "9:16":
         return h, w
     raise ValueError(f"Unknown ratio {ratio!r}")
+
+
+def encoder_preset(quality: str, fps: int) -> str:
+    """Pick a realtime x264 preset so 4K / 60 fps can still keep up."""
+    if quality in ("4k", "2k") or fps >= 60:
+        return "ultrafast"
+    return str(QUALITY_PRESETS[quality]["preset"])
 
 
 def find_ffmpeg() -> str:
@@ -138,11 +158,14 @@ def preferred_microphone(mics: list[str]) -> str | None:
     return mics[0] if mics else None
 
 
-def default_output_path(ratio: str, quality: str, width: int, height: int) -> Path:
+def default_output_path(
+    ratio: str, quality: str, width: int, height: int, fps: int | None = None
+) -> Path:
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     safe_ratio = ratio.replace(":", "x")
-    name = f"{stamp}_{safe_ratio}_{quality}_{width}x{height}.mp4"
+    fps_part = f"_{int(fps)}fps" if fps else ""
+    name = f"{stamp}_{safe_ratio}_{quality}_{width}x{height}{fps_part}.mp4"
     return RECORDINGS_DIR / name
 
 
@@ -173,33 +196,38 @@ class ScreenRecorder:
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._write_thread: threading.Thread | None = None
         self._err_thread: threading.Thread | None = None
         self._proc: subprocess.Popen | None = None
         self._error: str | None = None
         self._stderr_chunks: list[bytes] = []
+        self._frame_q: queue.Queue[bytes | None] = queue.Queue(maxsize=2)
         self.started_at: float | None = None
         self.frames_written = 0
+        self.frames_dropped = 0
 
     def start(self, ffmpeg: str) -> None:
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Wall-clock timestamps so duration follows real recording time even if
+        # 4K/60fps encoding cannot take every frame. CFR duplicates the last
+        # frame to fill gaps. Do not use +faststart here: that remux can get
+        # killed and leave a file that only plays the last few seconds.
         cmd = [
             ffmpeg,
             "-hide_banner",
             "-loglevel",
             "error",
             "-y",
-            "-fflags",
-            "+genpts",
             "-f",
             "rawvideo",
             "-pix_fmt",
             "bgr24",
             "-video_size",
             f"{self.width}x{self.height}",
-            "-framerate",
-            str(self.fps),
+            "-use_wallclock_as_timestamps",
+            "1",
             "-thread_queue_size",
-            "512",
+            "64",
             "-i",
             "pipe:0",
         ]
@@ -208,25 +236,21 @@ class ScreenRecorder:
                 "-f",
                 "dshow",
                 "-thread_queue_size",
-                "1024",
+                "4096",
                 "-rtbufsize",
-                "100M",
+                "512M",
                 "-i",
                 f"audio={self.mic_name}",
-                "-c:a",
-                "aac",
-                "-b:a",
-                self.audio_bitrate,
-                "-ar",
-                "48000",
-                "-ac",
-                "2",
             ]
-        else:
-            cmd += ["-an"]
-        if self.mic_name:
-            cmd += ["-map", "0:v:0", "-map", "1:a:0"]
         cmd += [
+            "-map",
+            "0:v:0",
+        ]
+        if self.mic_name:
+            cmd += ["-map", "1:a:0"]
+        cmd += [
+            "-filter:v",
+            "setpts=PTS-STARTPTS",
             "-c:v",
             "libx264",
             "-preset",
@@ -237,11 +261,30 @@ class ScreenRecorder:
             "yuv420p",
             "-tune",
             "zerolatency",
-            "-movflags",
-            "+faststart",
-            "-shortest",
-            str(self.output_path),
+            "-fps_mode",
+            "cfr",
+            "-r",
+            str(self.fps),
+            "-g",
+            str(self.fps),
         ]
+        if self.mic_name:
+            cmd += [
+                "-c:a",
+                "aac",
+                "-b:a",
+                self.audio_bitrate,
+                "-ar",
+                "48000",
+                "-ac",
+                "2",
+                "-af",
+                "aresample=async=1:first_pts=0",
+                "-shortest",
+            ]
+        else:
+            cmd += ["-an"]
+        cmd.append(str(self.output_path))
 
         self._proc = subprocess.Popen(
             cmd,
@@ -253,6 +296,8 @@ class ScreenRecorder:
         )
         self._err_thread = threading.Thread(target=self._drain_stderr, name="ffmpeg-stderr", daemon=True)
         self._err_thread.start()
+        self._write_thread = threading.Thread(target=self._write_loop, name="ffmpeg-stdin", daemon=True)
+        self._write_thread.start()
         self.started_at = time.perf_counter()
         self._thread = threading.Thread(target=self._loop, name="screen-recorder", daemon=True)
         self._thread.start()
@@ -267,22 +312,62 @@ class ScreenRecorder:
         except OSError:
             return
 
-    def stop(self, timeout: float = 20.0) -> Path | None:
+    def _write_loop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return
+        stdin = proc.stdin
+        try:
+            while True:
+                item = self._frame_q.get()
+                if item is None:
+                    break
+                stdin.write(item)
+                self.frames_written += 1
+        except (BrokenPipeError, OSError) as exc:
+            if not self._stop.is_set():
+                self._error = str(exc)
+
+    def _close_stdin(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    def stop(self, timeout: float = 60.0) -> Path | None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=timeout)
+            self._thread.join(timeout=5.0)
+        try:
+            self._frame_q.put_nowait(None)
+        except queue.Full:
+            try:
+                self._frame_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frame_q.put_nowait(None)
+            except queue.Full:
+                pass
+        if self._write_thread is not None:
+            self._write_thread.join(timeout=8.0)
+        self._close_stdin()
+        if self._write_thread is not None:
+            self._write_thread.join(timeout=5.0)
         proc = self._proc
         if proc is not None:
-            if proc.stdin:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
             if self._err_thread is not None:
                 self._err_thread.join(timeout=2)
             err_text = b"".join(self._stderr_chunks).decode("utf-8", errors="replace").strip()
@@ -306,7 +391,6 @@ class ScreenRecorder:
         proc = self._proc
         if proc is None or proc.stdin is None:
             return
-        stdin = proc.stdin
         import numpy as np
 
         interval = 1.0 / float(self.fps)
@@ -333,6 +417,10 @@ class ScreenRecorder:
                         continue
                     while next_t < now - interval:
                         next_t += interval
+                    if self._frame_q.full():
+                        self.frames_dropped += 1
+                        next_t += interval
+                        continue
                     cx, cy, cap_w, cap_h = self.get_frame()
                     cap_w = even(max(64, int(cap_w)))
                     cap_h = even(max(64, int(cap_h)))
@@ -347,12 +435,11 @@ class ScreenRecorder:
                         frame = captured
                     else:
                         frame = _resize_bgr(captured, out_frame)
+                    payload = np.ascontiguousarray(frame).tobytes()
                     try:
-                        stdin.write(np.ascontiguousarray(frame).tobytes())
-                    except (BrokenPipeError, OSError) as exc:
-                        self._error = str(exc)
-                        break
-                    self.frames_written += 1
+                        self._frame_q.put_nowait(payload)
+                    except queue.Full:
+                        self.frames_dropped += 1
                     next_t += interval
                     if proc.poll() is not None:
                         self._error = self._error or (
@@ -362,6 +449,10 @@ class ScreenRecorder:
                         break
         except Exception as exc:  # noqa: BLE001 — surface any capture failure on stop()
             self._error = str(exc)
+        try:
+            self._frame_q.put_nowait(None)
+        except queue.Full:
+            pass
 
 
 def _grab_padded(

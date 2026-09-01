@@ -38,9 +38,11 @@ from tkinter import messagebox, ttk
 
 from recorder import (
     NO_AUDIO,
+    FPS_CHOICES,
     QUALITY_PRESETS,
     ScreenRecorder,
     default_output_path,
+    encoder_preset,
     ensure_recording_deps,
     even,
     find_ffmpeg,
@@ -165,17 +167,33 @@ def virtual_screen_rect() -> tuple[int, int, int, int]:
     return left, top, left + width, top + height
 
 
-def monitor_rect_at(x: int, y: int) -> tuple[int, int, int, int]:
-    """Pixel bounds of the display that contains (x, y)."""
+def _monitor_info_at(x: int, y: int) -> MONITORINFO | None:
     pt = POINT(int(x), int(y))
     handle = user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
     if not handle:
-        return virtual_screen_rect()
+        return None
     info = MONITORINFO()
     info.cbSize = ctypes.sizeof(MONITORINFO)
     if not user32.GetMonitorInfoW(handle, ctypes.byref(info)):
+        return None
+    return info
+
+
+def monitor_rect_at(x: int, y: int) -> tuple[int, int, int, int]:
+    """Pixel bounds of the display that contains (x, y)."""
+    info = _monitor_info_at(x, y)
+    if info is None:
         return virtual_screen_rect()
     r = info.rcMonitor
+    return int(r.left), int(r.top), int(r.right), int(r.bottom)
+
+
+def monitor_work_rect_at(x: int, y: int) -> tuple[int, int, int, int]:
+    """Visible work area (excludes the taskbar) of the display that contains (x, y)."""
+    info = _monitor_info_at(x, y)
+    if info is None:
+        return virtual_screen_rect()
+    r = info.rcWork
     return int(r.left), int(r.top), int(r.right), int(r.bottom)
 
 
@@ -359,6 +377,10 @@ class CyanBorder:
             )
         self.win.geometry(f"+{x}+{y}")
 
+    @property
+    def top_left(self) -> tuple[int, int]:
+        return self.last_pos if self.last_pos is not None else (0, 0)
+
     def follow_center(self, cx: int, cy: int, *, stay_on_screen: bool | None = None) -> tuple[int, int]:
         """Place the box around (cx, cy). Clamps only while the box still fits on the monitor."""
         x = cx - (self.box_w // 2)
@@ -408,6 +430,298 @@ def setup_layered_window(hwnd: int) -> None:
         pass
 
 
+def setup_hud_window(hwnd: int) -> None:
+    """Control bar: visible, clickable, and excluded from the recording."""
+    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    style |= WS_EX_TOOLWINDOW
+    style &= ~WS_EX_TRANSPARENT
+    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+    try:
+        user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+    except OSError:
+        pass
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+class RecordHud:
+    """Bottom-left red rec dot. Timer always visible; buttons appear on hover."""
+
+    def __init__(self, master: tk.Misc, on_start, on_stop, on_refresh, on_exit) -> None:
+        self._on_start = on_start
+        self._on_stop = on_stop
+        self._on_refresh = on_refresh
+        self._on_exit = on_exit
+        self._busy = False
+        self._after_ids: list[str] = []
+        self._hovered = False
+        self._recording = False
+
+        self.win = tk.Toplevel(master)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg="#141414")
+        self.hwnd = 0
+        self.last_geom: tuple[int, int, int, int] | None = None
+
+        self.wrap = tk.Frame(self.win, bg="#141414", padx=8, pady=8)
+        self.wrap.pack()
+
+        self.dot = tk.Canvas(
+            self.wrap, width=22, height=22, bg="#141414", highlightthickness=0, bd=0
+        )
+        self.dot.pack()
+        self._dot_id = self.dot.create_oval(3, 3, 19, 19, fill="#FF2B2B", outline="#FF2B2B")
+
+        self.timer = tk.Label(
+            self.wrap,
+            text="00:00",
+            fg="#FF2B2B",
+            bg="#141414",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.timer.pack(pady=(4, 0))
+
+        self.btns = tk.Frame(self.wrap, bg="#141414")
+        btn_style = {
+            "font": ("Segoe UI", 9, "bold"),
+            "bd": 0,
+            "padx": 10,
+            "pady": 3,
+            "cursor": "hand2",
+            "width": 8,
+        }
+        self.btn_start = tk.Button(
+            self.btns, text="Start", bg="#1F7A3A", fg="white", activebackground="#25964A",
+            command=self._click_start, **btn_style,
+        )
+        self.btn_stop = tk.Button(
+            self.btns, text="Stop", bg="#A31D1D", fg="white", activebackground="#C42323",
+            command=self._click_stop, **btn_style,
+        )
+        self.btn_refresh = tk.Button(
+            self.btns, text="Refresh", bg="#3A3A3A", fg="white", activebackground="#555555",
+            command=self._click_refresh, **btn_style,
+        )
+        self.btn_exit = tk.Button(
+            self.btns, text="Exit", bg="#5A1A1A", fg="white", activebackground="#7A2424",
+            command=self._on_exit, **btn_style,
+        )
+        for widget in (self.btn_start, self.btn_stop, self.btn_refresh, self.btn_exit):
+            widget.pack(pady=2)
+
+        self.count_win = tk.Toplevel(master)
+        self.count_win.overrideredirect(True)
+        self.count_win.attributes("-topmost", True)
+        self.count_win.configure(bg="#141414")
+        self.count_label = tk.Label(
+            self.count_win,
+            text="",
+            fg="#FF2B2B",
+            bg="#141414",
+            font=("Segoe UI", 140, "bold"),
+            padx=40,
+            pady=10,
+        )
+        self.count_label.pack()
+        self.count_win.withdraw()
+
+        self.win.bind("<Enter>", self._on_enter)
+        self.win.bind("<Leave>", self._on_leave)
+        for child in self.wrap.winfo_children():
+            child.bind("<Enter>", self._on_enter)
+            child.bind("<Leave>", self._on_leave)
+        for child in self.btns.winfo_children():
+            child.bind("<Enter>", self._on_enter)
+            child.bind("<Leave>", self._on_leave)
+
+        self.win.update_idletasks()
+        self.win.update()
+        self.hwnd = get_hwnd(self.win)
+        setup_hud_window(self.hwnd)
+        self.count_hwnd = get_hwnd(self.count_win)
+        setup_hud_window(self.count_hwnd)
+        self.set_recording(False, 0.0)
+        self._show_buttons(False)
+        self.place_bottom_left()
+
+    def _click_start(self) -> None:
+        if self._busy or self._recording:
+            return
+        self.countdown(self._on_start)
+
+    def _click_stop(self) -> None:
+        self._cancel_countdown()
+        if not self._recording:
+            return
+        self._on_stop()
+
+    def _click_refresh(self) -> None:
+        self._cancel_countdown()
+        if self._recording:
+            self._on_stop()
+        self.countdown(self._on_start)
+
+    def countdown(self, callback) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self._cancel_after()
+        self._pending = callback
+        self._n = 3
+        self._step_countdown()
+
+    def _cancel_countdown(self) -> None:
+        self._cancel_after()
+        self._hide_count()
+        self._busy = False
+        self._pending = None
+
+    def _step_countdown(self) -> None:
+        if self._n >= 1:
+            self._show_count(self._n)
+            self._n -= 1
+            self._after_ids.append(self.win.after(1000, self._step_countdown))
+            return
+        self._hide_count()
+        self._busy = False
+        cb = getattr(self, "_pending", None)
+        self._pending = None
+        if cb is not None:
+            cb()
+
+    def _show_count(self, n: int) -> None:
+        self.count_label.config(text=str(n))
+        self.count_win.update_idletasks()
+        cx, cy = get_cursor_pos()
+        left, top, right, bottom = monitor_rect_at(cx, cy)
+        self.count_win.deiconify()
+        self.count_win.update_idletasks()
+        w = max(80, int(self.count_win.winfo_reqwidth()))
+        h = max(80, int(self.count_win.winfo_reqheight()))
+        x = left + (right - left - w) // 2
+        y = top + (bottom - top - h) // 2
+        user32.SetWindowPos(
+            self.count_hwnd,
+            HWND_TOPMOST,
+            x,
+            y,
+            w,
+            h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+
+    def _hide_count(self) -> None:
+        try:
+            self.count_win.withdraw()
+        except tk.TclError:
+            pass
+
+    def _cancel_after(self) -> None:
+        for aid in self._after_ids:
+            try:
+                self.win.after_cancel(aid)
+            except Exception:
+                pass
+        self._after_ids.clear()
+
+    def _on_enter(self, _event=None) -> None:
+        self._hovered = True
+        self._show_buttons(True)
+
+    def _on_leave(self, _event=None) -> None:
+        self.win.after(120, self._hide_if_left)
+
+    def _hide_if_left(self) -> None:
+        if self._pointer_inside():
+            return
+        self._hovered = False
+        self._show_buttons(False)
+
+    def _pointer_inside(self) -> bool:
+        try:
+            x, y = get_cursor_pos()
+            wx = int(self.win.winfo_rootx())
+            wy = int(self.win.winfo_rooty())
+            ww = int(self.win.winfo_width())
+            wh = int(self.win.winfo_height())
+        except tk.TclError:
+            return False
+        return wx <= x <= wx + ww and wy <= y <= wy + wh
+
+    def _show_buttons(self, show: bool) -> None:
+        if show:
+            if not self.btns.winfo_ismapped():
+                self.btns.pack(pady=(8, 0))
+        else:
+            if self.btns.winfo_ismapped():
+                self.btns.pack_forget()
+        self.place_bottom_left()
+
+    def set_recording(self, recording: bool, elapsed_s: float) -> None:
+        self._recording = recording
+        self.timer.config(text=_format_elapsed(elapsed_s))
+        fill = "#FF2B2B" if recording else "#7A2A2A"
+        self.dot.itemconfig(self._dot_id, fill=fill, outline=fill)
+        if recording:
+            self.btn_start.config(state="disabled")
+            self.btn_stop.config(state="normal")
+        else:
+            self.btn_start.config(state="normal")
+            self.btn_stop.config(state="disabled")
+
+    def place_bottom_left(self, ax: int | None = None, ay: int | None = None) -> None:
+        try:
+            self.win.update_idletasks()
+        except tk.TclError:
+            return
+        hud_w = max(1, int(self.win.winfo_reqwidth()))
+        hud_h = max(1, int(self.win.winfo_reqheight()))
+        if ax is None or ay is None:
+            ax, ay = get_cursor_pos()
+        left, top, right, bottom = monitor_work_rect_at(ax, ay)
+        margin = 8
+        x = left + margin
+        y = bottom - hud_h - margin
+        x = max(left, min(x, right - hud_w))
+        y = max(top, min(y, bottom - hud_h))
+        key = (x, y, hud_w, hud_h)
+        if self.last_geom == key:
+            return
+        self.last_geom = key
+        if self.hwnd:
+            user32.SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                x,
+                y,
+                hud_w,
+                hud_h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        else:
+            self.win.geometry(f"{hud_w}x{hud_h}+{x}+{y}")
+
+    def destroy(self) -> None:
+        self._cancel_after()
+        self._hide_count()
+        try:
+            self.count_win.destroy()
+        except tk.TclError:
+            pass
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record the screen inside a cursor-centered aspect-ratio border"
@@ -440,7 +754,14 @@ def parse_args() -> argparse.Namespace:
         "--quality",
         choices=tuple(QUALITY_PRESETS),
         default=None,
-        help="Video quality preset: low, hd, 2k",
+        help="Video quality preset: low, hd, 2k, 4k",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        choices=FPS_CHOICES,
+        default=None,
+        help="Recording frame rate: 24, 30, or 60",
     )
     parser.add_argument(
         "--mic",
@@ -486,6 +807,7 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     root.attributes("-topmost", True)
 
     quality_var = tk.StringVar(value="hd")
+    fps_var = tk.IntVar(value=30)
     ratio_var = tk.StringVar(value="16:9")
     custom_w = tk.StringVar(value="1920")
     custom_h = tk.StringVar(value="1080")
@@ -518,12 +840,26 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
             w, h = current_size_for(ratio_var.get())
             custom_w.set(str(w))
             custom_h.set(str(h))
-        q = QUALITY_PRESETS[quality_var.get()]
-        w_now, h_now = current_size_for(ratio_var.get())
+        qkey = quality_var.get()
+        q = QUALITY_PRESETS[qkey]
+        chosen = ratio_var.get()
+        w_now, h_now = current_size_for(chosen)
+        if chosen == "custom":
+            try:
+                enc_w, enc_h = even(int(custom_w.get())), even(int(custom_h.get()))
+            except ValueError:
+                enc_w, enc_h = w_now, h_now
+        else:
+            enc_w, enc_h = size_for_quality(chosen, qkey)
         if w_now >= 64 and h_now >= 64:
+            extra = (
+                f"  Saved as {enc_w} × {enc_h}."
+                if (enc_w, enc_h) != (w_now, h_now)
+                else ""
+            )
             size_note.set(
-                f"Now showing  {w_now} × {h_now} px  — stays fully on this screen.  "
-                f"{q['fps']} fps ({q['label']})"
+                f"On screen: {w_now} × {h_now} px.{extra}  "
+                f"{fps_var.get()} fps ({q['label']})"
             )
         else:
             size_note.set("Enter width and height (at least 64 × 64) to preview the window.")
@@ -554,7 +890,24 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
         ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
         q_row += 1
 
-    ttk.Label(frm, text="2. Microphone", font=("Segoe UI", 10, "bold")).grid(
+    ttk.Label(frm, text="2. Frame rate", font=("Segoe UI", 10, "bold")).grid(
+        row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
+    )
+    q_row += 1
+    fps_row = ttk.Frame(frm)
+    fps_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    for fps_val in FPS_CHOICES:
+        extra = "  (recommended)" if fps_val == 30 else ""
+        ttk.Radiobutton(
+            fps_row,
+            text=f"{fps_val} fps{extra}",
+            variable=fps_var,
+            value=fps_val,
+            command=refresh_size_labels,
+        ).pack(side="left", padx=(0, 16))
+    q_row += 1
+
+    ttk.Label(frm, text="3. Microphone", font=("Segoe UI", 10, "bold")).grid(
         row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
     )
     q_row += 1
@@ -575,7 +928,7 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
         ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
         q_row += 1
 
-    ttk.Label(frm, text="3. Frame size (the following border)", font=("Segoe UI", 10, "bold")).grid(
+    ttk.Label(frm, text="4. Frame size (the following border)", font=("Segoe UI", 10, "bold")).grid(
         row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
     )
     q_row += 1
@@ -613,7 +966,7 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     q_row += 1
     ttk.Label(
         frm,
-        text="Ctrl+Caps Lock parks. Ctrl+Shift and hold + / - zooms smoothly. Esc saves.",
+        text="Red rec dot sits in the bottom-left corner. Hover for Start / Stop / Refresh / Exit. 3-2-1 before Start only; Stop is instant.",
         foreground="#444444",
     ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
     q_row += 1
@@ -624,21 +977,23 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
         quality = quality_var.get()
         if ratio == "custom":
             try:
-                width = even(int(custom_w.get().strip()))
-                height = even(int(custom_h.get().strip()))
+                native_w = even(int(custom_w.get().strip()))
+                native_h = even(int(custom_h.get().strip()))
             except ValueError:
                 messagebox.showerror("Invalid size", "Custom width and height must be whole numbers.")
                 return
-            if width < 64 or height < 64:
+            if native_w < 64 or native_h < 64:
                 messagebox.showerror("Invalid size", "Custom size must be at least 64 × 64.")
                 return
-            if width > 7680 or height > 7680:
+            if native_w > 7680 or native_h > 7680:
                 messagebox.showerror("Invalid size", "Custom size must be 7680 × 7680 or smaller.")
                 return
-            width, height = screen_fit(width, height)
-            ratio_label = f"{width}:{height}"
+            width, height = screen_fit(native_w, native_h)
+            encode_w, encode_h = native_w, native_h
+            ratio_label = f"{native_w}:{native_h}"
         else:
-            width, height = screen_fit(*size_for_quality(ratio, quality))
+            encode_w, encode_h = size_for_quality(ratio, quality)
+            width, height = screen_fit(encode_w, encode_h)
             ratio_label = ratio
 
         display = mic_display.get()
@@ -648,9 +1003,12 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
 
         result = {
             "quality": quality,
+            "fps": int(fps_var.get()),
             "ratio": ratio_label,
             "width": width,
             "height": height,
+            "encode_width": encode_w,
+            "encode_height": encode_h,
             "mic_name": mic_name,
             "record": True,
         }
@@ -718,12 +1076,28 @@ def ask_setup_cli(mics: list[str]) -> dict | None:
         print(f"    {i}) {p['label']:3}  —  {p['detail']}{default}")
     print()
     quality = "hd"
+    q_max = str(len(keys))
     while True:
-        raw = input("  Choose quality [1/2/3] (default 2): ").strip() or "2"
-        if raw in ("1", "2", "3"):
+        raw = input(f"  Choose quality [1-{q_max}] (default 2): ").strip() or "2"
+        if raw.isdigit() and 1 <= int(raw) <= len(keys):
             quality = keys[int(raw) - 1]
             break
-        print("  Please enter 1, 2, or 3.")
+        print(f"  Please enter a number from 1 to {q_max}.")
+
+    print()
+    print("  Frame rate")
+    for i, fps_val in enumerate(FPS_CHOICES, start=1):
+        extra = "  (recommended)" if fps_val == 30 else ""
+        print(f"    {i}) {fps_val} fps{extra}")
+    print()
+    fps = 30
+    fps_max = str(len(FPS_CHOICES))
+    while True:
+        raw = input(f"  Choose frame rate [1-{fps_max}] (default 2): ").strip() or "2"
+        if raw.isdigit() and 1 <= int(raw) <= len(FPS_CHOICES):
+            fps = int(FPS_CHOICES[int(raw) - 1])
+            break
+        print(f"  Please enter a number from 1 to {fps_max}.")
 
     print()
     print("  Microphone")
@@ -759,41 +1133,51 @@ def ask_setup_cli(mics: list[str]) -> dict | None:
         input("  Press Enter to continue...")
 
     print()
-    w16, h16 = screen_fit(*size_for_quality("16:9", quality))
-    w916, h916 = screen_fit(*size_for_quality("9:16", quality))
+    enc16 = size_for_quality("16:9", quality)
+    enc916 = size_for_quality("9:16", quality)
+    w16, h16 = screen_fit(*enc16)
+    w916, h916 = screen_fit(*enc916)
     print("  Frame size (the following border — fitted to this screen)")
-    print(f"    1) 16:9  widescreen  {w16}x{h16}")
-    print(f"    2) 9:16  vertical    {w916}x{h916}")
+    print(f"    1) 16:9  widescreen  {w16}x{h16}   (file {enc16[0]}x{enc16[1]})")
+    print(f"    2) 9:16  vertical    {w916}x{h916}   (file {enc916[0]}x{enc916[1]})")
     print("    3) Custom width x height")
     print()
+    encode_w: int
+    encode_h: int
     while True:
         raw = input("  Choose size [1/2/3]: ").strip()
         if raw == "1":
             ratio, width, height = "16:9", w16, h16
+            encode_w, encode_h = enc16
             break
         if raw == "2":
             ratio, width, height = "9:16", w916, h916
+            encode_w, encode_h = enc916
             break
         if raw == "3":
             try:
-                width = even(int(input("  Width  (pixels): ").strip()))
-                height = even(int(input("  Height (pixels): ").strip()))
+                native_w = even(int(input("  Width  (pixels): ").strip()))
+                native_h = even(int(input("  Height (pixels): ").strip()))
             except ValueError:
                 print("  Please enter whole numbers.")
                 continue
-            if width < 64 or height < 64:
+            if native_w < 64 or native_h < 64:
                 print("  Size must be at least 64x64.")
                 continue
-            width, height = screen_fit(width, height)
-            ratio = f"{width}:{height}"
+            width, height = screen_fit(native_w, native_h)
+            encode_w, encode_h = native_w, native_h
+            ratio = f"{native_w}:{native_h}"
             break
         print("  Please enter 1, 2, or 3.")
 
     return {
         "quality": quality,
+        "fps": fps,
         "ratio": ratio,
         "width": width,
         "height": height,
+        "encode_width": encode_w,
+        "encode_height": encode_h,
         "mic_name": mic_name,
         "record": True,
     }
@@ -802,19 +1186,25 @@ def ask_setup_cli(mics: list[str]) -> dict | None:
 def resolve_session(args: argparse.Namespace, mics: list[str]) -> dict | None:
     """Build a session dict from CLI flags, or open the setup prompt."""
     overlay_only = bool(args.overlay_only)
+    fps = int(args.fps) if args.fps else 30
     fully_specified = bool(args.quality) and bool(args.ratio or (args.width and args.height))
     if overlay_only:
         ratio = args.ratio or "16:9"
         if args.width and args.height:
-            width, height = screen_fit(even(args.width), even(args.height))
-            ratio = f"{width}:{height}"
+            encode_w, encode_h = even(args.width), even(args.height)
+            width, height = screen_fit(encode_w, encode_h)
+            ratio = f"{encode_w}:{encode_h}"
         else:
             width, height = screen_fit(*configured_size(ratio))
+            encode_w, encode_h = width, height
         return {
             "quality": args.quality or "hd",
+            "fps": fps,
             "ratio": ratio,
             "width": width,
             "height": height,
+            "encode_width": encode_w,
+            "encode_height": encode_h,
             "mic_name": None,
             "record": False,
         }
@@ -822,11 +1212,13 @@ def resolve_session(args: argparse.Namespace, mics: list[str]) -> dict | None:
     if fully_specified:
         quality = args.quality or "hd"
         if args.width and args.height:
-            width, height = screen_fit(even(args.width), even(args.height))
-            ratio = f"{width}:{height}"
+            encode_w, encode_h = even(args.width), even(args.height)
+            width, height = screen_fit(encode_w, encode_h)
+            ratio = f"{encode_w}:{encode_h}"
         else:
             ratio = args.ratio or "16:9"
-            width, height = screen_fit(*size_for_quality(ratio, quality))
+            encode_w, encode_h = size_for_quality(ratio, quality)
+            width, height = screen_fit(encode_w, encode_h)
         mic_name: str | None
         if args.mic is None:
             mic_name = preferred_microphone(mics)
@@ -836,9 +1228,12 @@ def resolve_session(args: argparse.Namespace, mics: list[str]) -> dict | None:
             mic_name = args.mic
         return {
             "quality": quality,
+            "fps": fps,
             "ratio": ratio,
             "width": width,
             "height": height,
+            "encode_width": encode_w,
+            "encode_height": encode_h,
             "mic_name": mic_name,
             "record": True,
         }
@@ -861,17 +1256,25 @@ def run(
     *,
     record: bool,
     quality: str,
+    fps: int,
+    encode_width: int,
+    encode_height: int,
     mic_name: str | None,
     ffmpeg: str | None,
 ) -> None:
     box_w, box_h = screen_fit(max(50, int(width)), max(50, int(height)))
     border_w = max(2, min(30, int(border_w)))
+    fps = int(fps) if fps in FPS_CHOICES else 30
+    encode_w = even(max(64, int(encode_width)))
+    encode_h = even(max(64, int(encode_height)))
 
     overlay = CyanBorder(None, box_w, box_h, border_w, show_label=False)
     root = overlay.win
     recorder: ScreenRecorder | None = None
+    hud: RecordHud | None = None
     stopping = {"done": False}
     follow = {"locked": False, "center": get_cursor_pos(), "park_down": True}
+    take = {"active": False, "frozen": 0.0, "clock": ""}
     zoom = {
         "level": 1.0,
         "base_w": box_w,
@@ -918,6 +1321,87 @@ def run(
             overlay.redraw(BORDER_COLOR)
             print("  Border following the pointer again.")
 
+    def elapsed_now() -> float:
+        if take["active"] and recorder is not None:
+            return recorder.elapsed_s()
+        return float(take["frozen"])
+
+    def sync_hud() -> None:
+        if hud is None:
+            return
+        elapsed = elapsed_now()
+        clock = _format_elapsed(elapsed)
+        label_key = f"{take['active']}:{clock}"
+        if take["clock"] != label_key:
+            take["clock"] = label_key
+            hud.set_recording(bool(take["active"]), elapsed)
+        hud.place_bottom_left(*follow["center"])
+
+    def make_recorder() -> ScreenRecorder:
+        out = default_output_path(ratio, quality, encode_w, encode_h, fps)
+        q = QUALITY_PRESETS[quality]
+        return ScreenRecorder(
+            width=encode_w,
+            height=encode_h,
+            fps=fps,
+            crf=int(q["crf"]),
+            x264_preset=encoder_preset(quality, fps),
+            mic_name=mic_name,
+            audio_bitrate=str(q["audio_bitrate"]),
+            output_path=out,
+            get_frame=get_frame,
+        )
+
+    def begin_take() -> bool:
+        nonlocal recorder
+        if take["active"] and recorder is not None:
+            return True
+        if ffmpeg is None:
+            return False
+        rec = make_recorder()
+        try:
+            rec.start(ffmpeg)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Could not start recorder: {exc}")
+            return False
+        recorder = rec
+        take["active"] = True
+        take["frozen"] = 0.0
+        take["clock"] = ""
+        print(f"  Recording: {rec.output_path}")
+        sync_hud()
+        return True
+
+    def hud_stop() -> None:
+        nonlocal recorder
+        if recorder is None or not take["active"]:
+            return
+        print("  Stopping recorder...")
+        take["frozen"] = recorder.elapsed_s()
+        frames = recorder.frames_written
+        saved = None
+        try:
+            saved = recorder.stop()
+        except RuntimeError as exc:
+            print(f"  Recorder error: {exc}")
+        recorder = None
+        take["active"] = False
+        take["clock"] = ""
+        if saved:
+            mins, secs = divmod(int(take["frozen"]), 60)
+            print(f"  Saved: {saved}")
+            print(f"  Length: {mins:02d}:{secs:02d}  ({frames} frames)")
+        sync_hud()
+
+    def hud_start() -> None:
+        begin_take()
+
+    def hud_refresh() -> None:
+        if take["active"]:
+            hud_stop()
+        take["frozen"] = 0.0
+        begin_take()
+
     def finish() -> None:
         if stopping["done"]:
             return
@@ -925,7 +1409,7 @@ def run(
         saved = None
         elapsed = 0.0
         frames = 0
-        if recorder is not None:
+        if recorder is not None and take["active"]:
             print("  Stopping recorder...")
             elapsed = recorder.elapsed_s()
             frames = recorder.frames_written
@@ -933,14 +1417,15 @@ def run(
                 saved = recorder.stop()
             except RuntimeError as exc:
                 print(f"  Recorder error: {exc}")
+            take["active"] = False
+        if hud is not None:
+            hud.destroy()
         overlay.destroy()
         if saved:
             mins, secs = divmod(int(elapsed), 60)
             print()
             print(f"  Saved: {saved}")
             print(f"  Length: {mins:02d}:{secs:02d}  ({frames} frames)")
-        elif record:
-            print("  No video file was written.")
 
     def tick() -> None:
         if user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000:
@@ -972,6 +1457,7 @@ def run(
             set_zoom_level(zoom["level"] * ((1.0 / ZOOM_RATE) ** dt))
 
         move_to_cursor()
+        sync_hud()
         try:
             root.after(UPDATE_MS, tick)
         except tk.TclError:
@@ -990,35 +1476,22 @@ def run(
     q = QUALITY_PRESETS[quality]
     print()
     if record:
-        print(f"  Recording  {ratio}   {box_w}x{box_h}   {q['label']} @ {q['fps']} fps")
+        print(
+            f"  Recording  {ratio}   on-screen {box_w}x{box_h}   "
+            f"file {encode_w}x{encode_h}   {q['label']} @ {fps} fps"
+        )
         if mic_name:
             print(f"  Microphone: {mic_name}")
         else:
             print("  Microphone: off")
-        out = default_output_path(ratio, quality, box_w, box_h)
-        print(f"  File: {out}")
         print("  Cyan border = captured area (cursor stays in the center).")
+        print("  Red rec dot is in the bottom-left corner. Timer always; hover for Start / Stop / Refresh / Exit.")
+        print("  Start waits 3-2-1. Stop is immediate. Exit saves and quits.")
         print("  Press Ctrl+Caps Lock to park. Press it again to follow.")
         print("  Hold Ctrl+Shift and + to zoom in, - to zoom out (smooth, ratio locked).")
-        print("  Press Esc to stop and save.")
-        recorder = ScreenRecorder(
-            width=box_w,
-            height=box_h,
-            fps=int(q["fps"]),
-            crf=int(q["crf"]),
-            x264_preset=str(q["preset"]),
-            mic_name=mic_name,
-            audio_bitrate=str(q["audio_bitrate"]),
-            output_path=out,
-            get_frame=get_frame,
-        )
-        assert ffmpeg is not None
-        try:
-            recorder.start(ffmpeg)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  Could not start recorder: {exc}")
-            overlay.destroy()
-            return
+        print("  Press Esc to quit.")
+        hud = RecordHud(root, hud_start, hud_stop, hud_refresh, finish)
+        hud.countdown(lambda: begin_take())
     else:
         print(f"  Overlay only: {ratio}   {box_w}x{box_h}")
         print("  Press Ctrl+Caps Lock to park. Ctrl+Shift and + / - to zoom.")
@@ -1077,6 +1550,9 @@ def main() -> int:
             session["height"],
             record=session["record"],
             quality=session["quality"],
+            fps=int(session.get("fps") or 30),
+            encode_width=int(session.get("encode_width") or session["width"]),
+            encode_height=int(session.get("encode_height") or session["height"]),
             mic_name=session["mic_name"],
             ffmpeg=ffmpeg,
         )
