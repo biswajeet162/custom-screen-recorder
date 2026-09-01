@@ -2,55 +2,36 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-title Cursor Border Overlay
+title Cursor Follower — Record
 cls
 echo.
 echo   ========================================
-echo    Cursor Border Overlay
+echo    Cursor Follower — Screen Recorder
 echo   ========================================
 echo.
-echo   Option 1  -  16:9   (size set in cursor_border.py CONFIG)
-echo   Option 2  -  9:16   (size set in cursor_border.py CONFIG)
+echo   A setup window will ask for:
+echo     1. Video quality   (Low / HD / 2K)
+echo     2. Microphone
+echo     3. Frame size      (16:9 / 9:16 / custom)
 echo.
-echo   The cyan border follows your cursor.
-echo   Press Esc in the overlay to quit.
+echo   The red border follows your cursor.
+echo   Everything inside it is recorded, with voice.
+echo   Press Esc to stop and save (folder: recordings).
 echo.
-set "CHOICE="
-set /p "CHOICE=  Enter 1 or 2, then press Enter: "
 
-if /i "%CHOICE%"=="1" goto run_169
-if /i "%CHOICE%"=="2" goto run_916
-
-echo.
-echo   Invalid choice. Please run again and pick 1 or 2.
-echo.
-pause
-exit /b 1
-
-:run_169
-echo.
-echo   Starting 16:9 border...
 where py >nul 2>&1 && (
-  py -3 "%~dp0cursor_border.py" 16:9
+  py -3 -c "import mss,numpy,imageio_ffmpeg" 2>nul || py -3 -m pip install -r "%~dp0requirements.txt"
+  py -3 "%~dp0cursor_border.py"
   goto after
 )
-python "%~dp0cursor_border.py" 16:9
-goto after
-
-:run_916
-echo.
-echo   Starting 9:16 border...
-where py >nul 2>&1 && (
-  py -3 "%~dp0cursor_border.py" 9:16
-  goto after
-)
-python "%~dp0cursor_border.py" 9:16
+python -c "import mss,numpy,imageio_ffmpeg" 2>nul || python -m pip install -r "%~dp0requirements.txt"
+python "%~dp0cursor_border.py"
 
 :after
+echo.
 if errorlevel 1 (
-  echo.
   echo   Something went wrong. Is Python installed and on PATH?
   echo.
-  pause
 )
+pause
 endlocal
