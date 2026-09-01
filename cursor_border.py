@@ -1,8 +1,8 @@
 """
 Cursor-centered aspect-ratio border overlay for Windows.
 
-Shows a setup prompt (quality, microphone, frame size), then a red rectangle
-that follows the mouse. The screen inside that rectangle is recorded to MP4
+Shows a setup prompt (quality, microphone, frame size) with a live cyan
+preview of the chosen size, then records the screen inside that rectangle
 with the chosen microphone. Press Ctrl to park the border in place.
 Press Ctrl again to follow the pointer. Press Esc to stop and save.
 """
@@ -61,9 +61,8 @@ OPTION2_HEIGHT = 1280
 
 # Border look
 BORDER_WIDTH = 3
-BORDER_COLOR = "#FF2B2B"  # red while recording and following
-BORDER_COLOR_IDLE = "#00FFFF"  # cyan when overlay-only
-BORDER_COLOR_LOCKED = "#FFD000"  # gold when parked (Ctrl)
+BORDER_COLOR = "#00FFFF"  # cyan
+BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl)
 
 # =============================================================================
 
@@ -89,14 +88,150 @@ def configured_size(ratio: str) -> tuple[int, int]:
     return int(OPTION2_WIDTH), int(OPTION2_HEIGHT)
 
 
-def get_hwnd(root: tk.Tk) -> int:
+def get_hwnd(win: tk.Misc) -> int:
     """Resolve the real top-level HWND Tk uses for the overlay window."""
-    hwnd = int(root.winfo_id())
+    hwnd = int(win.winfo_id())
     ancestor = int(user32.GetAncestor(hwnd, GA_ROOT))
     if ancestor:
         return ancestor
     parent = int(user32.GetParent(hwnd))
     return parent or hwnd
+
+
+def _draw_inner_bars(canvas: tk.Canvas, w: int, h: int, bw: int, color: str) -> None:
+    """Four cyan bars fully inside the window so right/bottom are never clipped."""
+    canvas.delete("bar")
+    bw = max(2, int(bw))
+    # Keep the stroke inside the HWND. Layered windows clip the last screen pixel,
+    # so inset by 2px and draw with line width (more reliable than edge rectangles).
+    m = 2
+    c = bw / 2.0
+    x0, y0 = m, m
+    x1, y1 = max(m + bw, w - m), max(m + bw, h - m)
+    canvas.create_line(x0, y0 + c, x1, y0 + c, fill=color, width=bw, capstyle="projecting", tags="bar")
+    canvas.create_line(x0, y1 - c, x1, y1 - c, fill=color, width=bw, capstyle="projecting", tags="bar")
+    canvas.create_line(x0 + c, y0, x0 + c, y1, fill=color, width=bw, capstyle="projecting", tags="bar")
+    canvas.create_line(x1 - c, y0, x1 - c, y1, fill=color, width=bw, capstyle="projecting", tags="bar")
+
+
+class CyanBorder:
+    """Click-through cyan rectangle. Border is drawn inside the frame (visible on all 4 sides)."""
+
+    def __init__(
+        self,
+        master: tk.Misc | None,
+        box_w: int,
+        box_h: int,
+        border_w: int,
+        *,
+        show_label: bool = False,
+    ) -> None:
+        self.border_w = max(2, min(30, int(border_w)))
+        self.show_label = show_label
+        self.box_w = even(max(50, box_w))
+        self.box_h = even(max(50, box_h))
+        self.hwnd = 0
+        self.last_pos: tuple[int, int] | None = None
+        self.color = BORDER_COLOR
+
+        if master is None:
+            self.win: tk.Misc = tk.Tk()
+        else:
+            self.win = tk.Toplevel(master)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg=KEY_COLOR)
+        self.win.geometry(f"{self.box_w}x{self.box_h}+0+0")
+
+        self.canvas = tk.Canvas(
+            self.win,
+            width=self.box_w,
+            height=self.box_h,
+            bg=KEY_COLOR,
+            highlightthickness=0,
+            bd=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self.win.update_idletasks()
+        self.win.update()
+        self.hwnd = get_hwnd(self.win)
+        setup_layered_window(self.hwnd)
+        try:
+            self.win.attributes("-transparentcolor", KEY_COLOR)
+        except tk.TclError:
+            pass
+        self.redraw(self.color)
+
+    def redraw(self, color: str | None = None) -> None:
+        if color is not None:
+            self.color = color
+        _draw_inner_bars(self.canvas, self.box_w, self.box_h, self.border_w, self.color)
+        self.canvas.delete("sizelabel")
+        if self.show_label:
+            self.canvas.create_text(
+                self.box_w // 2,
+                self.border_w + 14,
+                text=f"{self.box_w}  ×  {self.box_h}",
+                fill=self.color,
+                font=("Segoe UI", 16, "bold"),
+                tags="sizelabel",
+            )
+
+    def set_size(self, box_w: int, box_h: int) -> None:
+        self.box_w = even(max(50, box_w))
+        self.box_h = even(max(50, box_h))
+        self.canvas.config(width=self.box_w, height=self.box_h)
+        if self.hwnd:
+            user32.SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                self.box_w,
+                self.box_h,
+                SWP_NOMOVE | SWP_NOACTIVATE,
+            )
+        self.win.geometry(f"{self.box_w}x{self.box_h}")
+        self.last_pos = None
+        self.redraw()
+
+    def move_top_left(self, x: int, y: int) -> None:
+        if self.last_pos == (x, y):
+            return
+        self.last_pos = (x, y)
+        if self.hwnd:
+            user32.SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+        self.win.geometry(f"+{x}+{y}")
+
+    def follow_center(self, cx: int, cy: int) -> None:
+        self.move_top_left(cx - (self.box_w // 2), cy - (self.box_h // 2))
+
+    def center_on_screen(self) -> None:
+        sw = int(self.win.winfo_screenwidth())
+        sh = int(self.win.winfo_screenheight())
+        self.move_top_left((sw - self.box_w) // 2, (sh - self.box_h) // 2)
+
+    def lift_behind(self, other: tk.Misc) -> None:
+        """Keep the setup dialog visually above this preview."""
+        try:
+            other.attributes("-topmost", True)
+            other.lift()
+        except tk.TclError:
+            pass
+
+    def destroy(self) -> None:
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
 
 
 def setup_layered_window(hwnd: int) -> None:
@@ -211,21 +346,22 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
         radio_169.config(text=f"16:9 widescreen   {w16} × {h16}")
         radio_916.config(text=f"9:16 vertical     {w916} × {h916}")
         if ratio_var.get() != "custom":
-            w, h = current_size_for("16:9")
+            w, h = current_size_for(ratio_var.get())
             custom_w.set(str(w))
             custom_h.set(str(h))
         q = QUALITY_PRESETS[quality_var.get()]
-        if ratio_var.get() == "custom":
+        w_now, h_now = current_size_for(ratio_var.get())
+        if w_now >= 64 and h_now >= 64:
             size_note.set(
-                f"Records your custom size at {q['fps']} fps  ({q['label']} encode)"
+                f"Now showing  {w_now} × {h_now} px  — the cyan box is that window.  "
+                f"{q['fps']} fps ({q['label']})"
             )
         else:
-            size_note.set(
-                f"Records inside the red border at {q['fps']} fps  ({q['label']}: {q['detail']})"
-            )
+            size_note.set("Enter width and height (at least 64 × 64) to preview the window.")
         custom_state = "normal" if ratio_var.get() == "custom" else "disabled"
         entry_w.configure(state=custom_state)
         entry_h.configure(state=custom_state)
+        update_preview()
 
     pad = {"padx": 16, "pady": 4}
     frm = ttk.Frame(root, padding=12)
@@ -308,7 +444,7 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     q_row += 1
     ttk.Label(
         frm,
-        text="Ctrl parks the border so it stops following the pointer. Ctrl again resumes. Esc saves.",
+        text="The cyan box on your screen is the live size. Ctrl parks it. Esc saves after start.",
         foreground="#444444",
     ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
     q_row += 1
@@ -348,6 +484,10 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
             "mic_name": mic_name,
             "record": True,
         }
+        try:
+            preview.destroy()
+        except Exception:
+            pass
         root.destroy()
 
     btns = ttk.Frame(frm)
@@ -355,13 +495,43 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     ttk.Button(btns, text="Cancel", command=root.destroy).pack(side="right", padx=4)
     ttk.Button(btns, text="Start recording", command=start).pack(side="right", padx=4)
 
+    preview_holder: dict[str, CyanBorder | None] = {"ov": None}
+
+    def update_preview() -> None:
+        w, h = current_size_for(ratio_var.get())
+        if w < 64 or h < 64:
+            return
+        ov = preview_holder["ov"]
+        if ov is None:
+            return
+        if ov.box_w != w or ov.box_h != h:
+            ov.set_size(w, h)
+        ov.center_on_screen()
+        ov.lift_behind(root)
+
+    w0, h0 = size_for_quality("16:9", quality_var.get())
+    preview = CyanBorder(root, w0, h0, BORDER_WIDTH, show_label=True)
+    preview_holder["ov"] = preview
+
+    def on_custom_edit(*_args: object) -> None:
+        if ratio_var.get() == "custom":
+            update_preview()
+
+    custom_w.trace_add("write", on_custom_edit)
+    custom_h.trace_add("write", on_custom_edit)
+
     refresh_size_labels()
+    preview.center_on_screen()
     root.update_idletasks()
-    w, h = root.winfo_reqwidth(), root.winfo_reqheight()
-    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+    root.geometry("+32+32")
+    root.lift()
+    root.attributes("-topmost", True)
     root.protocol("WM_DELETE_WINDOW", root.destroy)
     root.mainloop()
+    try:
+        preview.destroy()
+    except Exception:
+        pass
     return result
 
 
@@ -526,84 +696,33 @@ def run(
     box_w = even(max(50, int(width)))
     box_h = even(max(50, int(height)))
     border_w = max(2, min(30, int(border_w)))
-    rec_color = BORDER_COLOR if record else BORDER_COLOR_IDLE
 
-    # Outer ring is the viewfinder; inner box_w x box_h is what gets recorded
-    win_w = box_w + 2 * border_w
-    win_h = box_h + 2 * border_w
-
-    root = tk.Tk()
-    root.title(f"Cursor Border {ratio}")
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
-    root.configure(bg=KEY_COLOR)
-    root.geometry(f"{win_w}x{win_h}+0+0")
-
-    canvas = tk.Canvas(
-        root,
-        width=win_w,
-        height=win_h,
-        bg=KEY_COLOR,
-        highlightthickness=0,
-        bd=0,
-    )
-    canvas.pack(fill="both", expand=True)
-
-    bw = border_w
-    bars = (
-        canvas.create_rectangle(0, 0, win_w, bw, fill=rec_color, outline=""),
-        canvas.create_rectangle(0, win_h - bw, win_w, win_h, fill=rec_color, outline=""),
-        canvas.create_rectangle(0, 0, bw, win_h, fill=rec_color, outline=""),
-        canvas.create_rectangle(win_w - bw, 0, win_w, win_h, fill=rec_color, outline=""),
-    )
-
-    hwnd_holder: dict[str, int] = {"hwnd": 0}
-    last_pos: dict[str, tuple[int, int] | None] = {"xy": None}
+    overlay = CyanBorder(None, box_w, box_h, border_w, show_label=False)
+    root = overlay.win
     recorder: ScreenRecorder | None = None
     stopping = {"done": False}
     follow = {"locked": False, "center": get_cursor_pos(), "ctrl_down": True}
 
-    def paint_border(color: str) -> None:
-        for item in bars:
-            canvas.itemconfig(item, fill=color)
-
     def get_frame_center() -> tuple[int, int]:
         """Center of the framed region — frozen while Ctrl-parked."""
-        return follow["center"]
+        cx, cy = follow["center"]
+        return int(cx), int(cy)
 
     def move_to_cursor() -> None:
-        """Place the box so the live cursor sits exactly at its content center."""
         if follow["locked"]:
             cx, cy = follow["center"]
         else:
             cx, cy = get_cursor_pos()
             follow["center"] = (cx, cy)
-        x = cx - (box_w // 2) - bw
-        y = cy - (box_h // 2) - bw
-        if last_pos["xy"] == (x, y):
-            return
-        last_pos["xy"] = (x, y)
-
-        hwnd = hwnd_holder["hwnd"]
-        if hwnd:
-            user32.SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                x,
-                y,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
-            )
-        root.geometry(f"+{x}+{y}")
+        overlay.follow_center(int(cx), int(cy))
 
     def toggle_follow() -> None:
         follow["locked"] = not follow["locked"]
         if follow["locked"]:
-            paint_border(BORDER_COLOR_LOCKED)
+            overlay.redraw(BORDER_COLOR_LOCKED)
             print("  Border parked — pointer is free. Ctrl again to follow.")
         else:
-            paint_border(rec_color)
+            overlay.redraw(BORDER_COLOR)
             print("  Border following the pointer again.")
 
     def finish() -> None:
@@ -621,10 +740,7 @@ def run(
                 saved = recorder.stop()
             except RuntimeError as exc:
                 print(f"  Recorder error: {exc}")
-        try:
-            root.destroy()
-        except tk.TclError:
-            pass
+        overlay.destroy()
         if saved:
             mins, secs = divmod(int(elapsed), 60)
             print()
@@ -642,20 +758,13 @@ def run(
             toggle_follow()
         follow["ctrl_down"] = ctrl_down
         move_to_cursor()
-        root.after(UPDATE_MS, tick)
-
-    root.update_idletasks()
-    root.update()
-    hwnd = get_hwnd(root)
-    hwnd_holder["hwnd"] = hwnd
-    setup_layered_window(hwnd)
-    try:
-        root.attributes("-transparentcolor", KEY_COLOR)
-    except tk.TclError:
-        pass
+        try:
+            root.after(UPDATE_MS, tick)
+        except tk.TclError:
+            return
 
     user32.SetWindowPos(
-        hwnd,
+        overlay.hwnd,
         HWND_TOPMOST,
         0,
         0,
@@ -674,8 +783,8 @@ def run(
             print("  Microphone: off")
         out = default_output_path(ratio, quality, box_w, box_h)
         print(f"  File: {out}")
-        print("  Red border = captured area (cursor stays in the center).")
-        print("  Press Ctrl to park the border (gold). Ctrl again to follow.")
+        print("  Cyan border = captured area (cursor stays in the center).")
+        print("  Press Ctrl to park the border. Ctrl again to follow.")
         print("  Press Esc to stop and save.")
         recorder = ScreenRecorder(
             width=box_w,
@@ -693,10 +802,7 @@ def run(
             recorder.start(ffmpeg)
         except Exception as exc:  # noqa: BLE001
             print(f"  Could not start recorder: {exc}")
-            try:
-                root.destroy()
-            except tk.TclError:
-                pass
+            overlay.destroy()
             return
     else:
         print(f"  Overlay only: {ratio}   {box_w}x{box_h}")

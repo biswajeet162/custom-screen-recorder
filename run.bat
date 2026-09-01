@@ -14,8 +14,8 @@ echo     1. Video quality   (Low / HD / 2K)
 echo     2. Microphone
 echo     3. Frame size      (16:9 / 9:16 / custom)
 echo.
-echo   The red border follows your cursor.
-echo   Everything inside it is recorded, with voice.
+echo   The cyan border on screen is the window you will record.
+echo   Pick 16:9, 9:16, or custom to see that size immediately.
 echo   Press Ctrl to park the border (stops following).
 echo   Press Ctrl again to follow the pointer.
 echo   Press Esc to stop and save (folder: recordings).
