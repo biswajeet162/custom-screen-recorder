@@ -12,8 +12,25 @@ from __future__ import annotations
 import argparse
 import ctypes
 import sys
-import tkinter as tk
 from ctypes import wintypes
+
+# Must run before tkinter / mss create windows, or Windows will stretch the
+# preview and then shrink the recording box when capture becomes DPI-aware.
+PROCESS_PER_MONITOR_DPI_AWARE = 2
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+_user32_early = ctypes.windll.user32
+try:
+    _user32_early.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+except Exception:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+    except Exception:
+        try:
+            _user32_early.SetProcessDPIAware()
+        except Exception:
+            pass
+
+import tkinter as tk
 from tkinter import messagebox, ttk
 
 from recorder import (
@@ -103,6 +120,24 @@ user32.MonitorFromPoint.argtypes = [POINT, wintypes.DWORD]
 user32.MonitorFromPoint.restype = wintypes.HANDLE
 user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
 user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+
+def enable_dpi_awareness() -> None:
+    """Keep using real monitor pixels (safe to call more than once)."""
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+        return
+    except Exception:
+        pass
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 
 def get_cursor_pos() -> tuple[int, int]:
@@ -249,7 +284,26 @@ class CyanBorder:
             self.win.attributes("-transparentcolor", KEY_COLOR)
         except tk.TclError:
             pass
+        self._apply_pixel_size()
         self.redraw(self.color)
+
+    def _apply_pixel_size(self, x: int | None = None, y: int | None = None) -> None:
+        """Size/move with Win32 pixels (not Tk-scaled geometry)."""
+        if not self.hwnd:
+            return
+        flags = SWP_NOACTIVATE | SWP_SHOWWINDOW
+        if x is None or y is None:
+            flags |= SWP_NOMOVE
+            x, y = 0, 0
+        user32.SetWindowPos(
+            self.hwnd,
+            HWND_TOPMOST,
+            int(x),
+            int(y),
+            self.box_w,
+            self.box_h,
+            flags,
+        )
 
     def redraw(self, color: str | None = None) -> None:
         if color is not None:
@@ -269,16 +323,7 @@ class CyanBorder:
     def set_size(self, box_w: int, box_h: int) -> None:
         self.box_w, self.box_h = screen_fit(box_w, box_h)
         self.canvas.config(width=self.box_w, height=self.box_h)
-        if self.hwnd:
-            user32.SetWindowPos(
-                self.hwnd,
-                HWND_TOPMOST,
-                0,
-                0,
-                self.box_w,
-                self.box_h,
-                SWP_NOMOVE | SWP_NOACTIVATE,
-            )
+        self._apply_pixel_size()
         self.win.geometry(f"{self.box_w}x{self.box_h}")
         self.last_pos = None
         self.redraw()
@@ -924,6 +969,7 @@ def run(
 
 
 def main() -> int:
+    enable_dpi_awareness()
     args = parse_args()
     print()
     print("  Cursor Follower")
