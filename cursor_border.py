@@ -215,6 +215,7 @@ BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl+Caps Lock)
 
 KEY_COLOR = "#010101"
 KEY_COLORREF = 0x00010101  # 0x00bbggrr for RGB(1,1,1)
+KEY_RGB = (1, 1, 1)
 UPDATE_MS = 8  # ~120 FPS — keeps cursor locked to box center
 ZOOM_RATE = 1.55  # size multiplier per second while arrow keys are held (smooth)
 ZOOM_MIN = 0.25
@@ -247,6 +248,8 @@ user32.MonitorFromPoint.argtypes = [POINT, wintypes.DWORD]
 user32.MonitorFromPoint.restype = wintypes.HANDLE
 user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
 user32.GetMonitorInfoW.restype = wintypes.BOOL
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+user32.GetWindowRect.restype = wintypes.BOOL
 
 
 def enable_dpi_awareness() -> None:
@@ -583,11 +586,9 @@ class CyanBorder:
         rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
         if shape == "circle":
             mask = webcam_circle_mask(sw, sh)
-            key = np.array([1, 1, 1], dtype=np.float32)
-            rgb = (
-                rgb.astype(np.float32) * mask[:, :, None]
-                + key * (1.0 - mask[:, :, None])
-            ).astype(np.uint8)
+            key = np.array(KEY_RGB, dtype=np.uint8)
+            outside = mask <= 0.5
+            rgb[outside] = key
         img = Image.fromarray(rgb)
         self._webcam_photo = ImageTk.PhotoImage(img)
         self.canvas.delete("webcam")
