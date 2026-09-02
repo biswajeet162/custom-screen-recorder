@@ -1,8 +1,8 @@
 """
 Cursor-centered aspect-ratio border overlay for Windows.
 
-Shows a fullscreen two-column setup window (capture settings and camera options)
-then records the screen inside the chosen frame with the chosen microphone.
+Shows a fullscreen two-column setup window with a live cyan recording frame and
+webcam overlay on screen, then records inside that frame with the chosen microphone.
 Press Ctrl+Caps Lock to park the border.
 Press Ctrl+Caps Lock again to follow the pointer.
 Hold Ctrl+Shift and Right to zoom the border in, or Left to zoom out.
@@ -1585,8 +1585,146 @@ def ask_setup_gui(
         key: tk.StringVar(value=DEFAULT_SHORTCUTS[key]) for key in DEFAULT_SHORTCUTS
     }
     size_note = tk.StringVar()
+    preview_holder: dict[str, CyanBorder | None] = {"ov": None}
+    cam_state: dict = {
+        "webcam": None,
+        "encode_ox": 0,
+        "encode_oy": 0,
+        "use_custom": False,
+        "after_id": None,
+    }
+
+    def stop_setup_webcam(keep_capture: bool = False) -> WebcamCapture | None:
+        aid = cam_state.get("after_id")
+        if aid:
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+            cam_state["after_id"] = None
+        wc = cam_state.get("webcam")
+        if wc is not None:
+            if keep_capture:
+                cam_state["webcam"] = None
+                return wc
+            wc.stop()
+            cam_state["webcam"] = None
+        return None
+
+    def webcam_frame_dims() -> tuple[int | None, int | None]:
+        wc = cam_state.get("webcam")
+        if wc is None:
+            return None, None
+        frame = wc.get_frame()
+        if frame is None:
+            return None, None
+        return int(frame.shape[1]), int(frame.shape[0])
+
+    def apply_preset_position() -> None:
+        enc_w, enc_h = current_encode_size()
+        fw, fh = webcam_frame_dims()
+        rot = camera_rotation_value()
+        disp_w, disp_h = (
+            overlay_source_dims(fw, fh, rot) if fw and fh else (fw, fh)
+        )
+        _, _, ox, oy = camera_overlay_pixels(
+            enc_w,
+            enc_h,
+            camera_size_key(),
+            camera_position_key(),
+            frame_w=disp_w,
+            frame_h=disp_h,
+            zoom=camera_zoom_value(),
+            rotation_deg=rot,
+        )
+        cam_state["encode_ox"] = ox
+        cam_state["encode_oy"] = oy
+        cam_state["use_custom"] = False
+
+    def on_camera_moved(ox: int, oy: int) -> None:
+        cam_state["encode_ox"] = ox
+        cam_state["encode_oy"] = oy
+        cam_state["use_custom"] = True
+
+    def update_preview() -> None:
+        w, h = current_size_for(ratio_key())
+        if w < 64 or h < 64:
+            return
+        ov = preview_holder.get("ov")
+        if ov is None:
+            return
+        if ov.box_w != w or ov.box_h != h:
+            ov.set_size(w, h)
+        ov.center_on_screen()
+        lift_preview_above_settings(root, ov)
+
+    def refresh_camera_overlay() -> None:
+        wc = cam_state.get("webcam")
+        ov = preview_holder.get("ov")
+        if wc is None or ov is None:
+            return
+        frame = wc.get_frame()
+        enc_w, enc_h = current_encode_size()
+        if frame is None or enc_w <= 0 or enc_h <= 0:
+            return
+        ov.update_webcam_overlay(
+            frame,
+            enc_w,
+            enc_h,
+            int(cam_state.get("encode_ox", 0)),
+            int(cam_state.get("encode_oy", 0)),
+            camera_shape_key(),
+            camera_size_key(),
+            camera_zoom_value(),
+            camera_rotation_value(),
+        )
+
+    def tick_setup_camera() -> None:
+        refresh_camera_overlay()
+        cam_state["after_id"] = root.after(33, tick_setup_camera)
+
+    def sync_setup_webcam() -> None:
+        stop_setup_webcam()
+        ov = preview_holder.get("ov")
+        if ov is not None:
+            ov.clear_webcam_overlay()
+        name = selected_camera_name()
+        if not name:
+            if not cam_state.get("use_custom"):
+                apply_preset_position()
+            update_preview()
+            return
+        dev = find_camera(name, catalog)
+        if dev is None:
+            return
+        try:
+            wc = WebcamCapture.open_device(dev, catalog=catalog)
+        except Exception:
+            return
+        cam_state["webcam"] = wc
+        if not cam_state.get("use_custom"):
+            apply_preset_position()
+        update_preview()
+        tick_setup_camera()
+
+    def on_camera_combo_change(_event: object = None) -> None:
+        cam_state["use_custom"] = False
+        sync_setup_webcam()
+
+    def on_camera_layout_change(_event: object = None) -> None:
+        if not cam_state.get("use_custom"):
+            apply_preset_position()
+        update_preview()
+        refresh_camera_overlay()
 
     def close_setup() -> None:
+        stop_setup_webcam()
+        ov = preview_holder.get("ov")
+        if ov is not None:
+            try:
+                ov.destroy()
+            except Exception:
+                pass
         root.destroy()
 
     def selected_camera_name() -> str | None:
@@ -1679,6 +1817,10 @@ def ask_setup_gui(
     def on_settings_change(*_args: object) -> None:
         update_custom_state()
         update_size_note()
+        if not cam_state.get("use_custom"):
+            apply_preset_position()
+        update_preview()
+        refresh_camera_overlay()
 
     def on_quality_change(_event: object = None) -> None:
         refresh_ratio_dropdown()
@@ -1692,12 +1834,15 @@ def ask_setup_gui(
             return
         enc_w, enc_h = current_encode_size()
         cam_name = selected_camera_name()
-        _, _, ox, oy = camera_overlay_pixels(
-            enc_w,
-            enc_h,
-            camera_size_key(),
-            camera_position_key(),
-        )
+        if cam_state.get("use_custom"):
+            ox, oy = int(cam_state["encode_ox"]), int(cam_state["encode_oy"])
+        else:
+            _, _, ox, oy = camera_overlay_pixels(
+                enc_w,
+                enc_h,
+                camera_size_key(),
+                camera_position_key(),
+            )
         shortcuts = {
             key: shortcut_vars[key].get().strip() for key in DEFAULT_SHORTCUTS
         }
@@ -1719,9 +1864,15 @@ def ask_setup_gui(
             "camera_zoom": camera_zoom_value(),
             "camera_rotation": camera_rotation_value(),
             "shortcuts": shortcuts,
-            "webcam_capture": None,
+            "webcam_capture": stop_setup_webcam(keep_capture=True),
             "record": True,
         }
+        ov = preview_holder.get("ov")
+        if ov is not None:
+            try:
+                ov.destroy()
+            except Exception:
+                pass
         root.destroy()
 
     outer = tk.Frame(root, bg=SETUP_BG)
@@ -1935,15 +2086,81 @@ def ask_setup_gui(
     quality_combo.bind("<<ComboboxSelected>>", on_quality_change)
     ratio_combo.bind("<<ComboboxSelected>>", lambda _e: on_settings_change())
     fps_combo.bind("<<ComboboxSelected>>", lambda _e: on_settings_change())
+    camera_combo.bind("<<ComboboxSelected>>", on_camera_combo_change)
+    shape_combo.bind("<<ComboboxSelected>>", on_camera_layout_change)
+    size_combo.bind("<<ComboboxSelected>>", on_camera_layout_change)
+    position_combo.bind("<<ComboboxSelected>>", on_camera_layout_change)
+    zoom_combo.bind("<<ComboboxSelected>>", on_camera_layout_change)
+    rotation_combo.bind("<<ComboboxSelected>>", on_camera_layout_change)
     custom_w.trace_add("write", on_settings_change)
     custom_h.trace_add("write", on_settings_change)
+
+    w0, h0 = current_size_for(ratio_key())
+    if w0 < 64:
+        w0, h0 = screen_fit(*size_for_quality("16:9", quality_key()))
+    preview = CyanBorder(root, w0, h0, BORDER_WIDTH, show_label=True)
+    preview_holder["ov"] = preview
+
+    drag_state: dict[str, bool] = {"active": False}
+
+    def on_preview_press(event: tk.Event) -> None:
+        if cam_state.get("webcam") is None:
+            return
+        drag_state["active"] = True
+
+    def on_preview_drag(event: tk.Event) -> None:
+        if not drag_state.get("active"):
+            return
+        ov = preview_holder.get("ov")
+        if ov is None:
+            return
+        enc_w, enc_h = current_encode_size()
+        fw, fh = webcam_frame_dims()
+        rot = camera_rotation_value()
+        disp_w, disp_h = (
+            overlay_source_dims(fw, fh, rot) if fw and fh else (fw, fh)
+        )
+        cam_w, cam_h, _, _ = camera_overlay_pixels(
+            enc_w,
+            enc_h,
+            camera_size_key(),
+            camera_position_key(),
+            frame_w=disp_w,
+            frame_h=disp_h,
+            zoom=camera_zoom_value(),
+            rotation_deg=rot,
+        )
+        ox = int(round(event.x * enc_w / max(1, ov.box_w)))
+        oy = int(round(event.y * enc_h / max(1, ov.box_h)))
+        ox = max(0, min(ox, enc_w - cam_w))
+        oy = max(0, min(oy, enc_h - cam_h))
+        on_camera_moved(ox, oy)
+        refresh_camera_overlay()
+
+    def on_preview_release(_event: tk.Event) -> None:
+        drag_state["active"] = False
+
+    preview.canvas.bind("<ButtonPress-1>", on_preview_press)
+    preview.canvas.bind("<B1-Motion>", on_preview_drag)
+    preview.canvas.bind("<ButtonRelease-1>", on_preview_release)
+    preview.canvas.configure(cursor="hand2")
 
     refresh_ratio_dropdown("16:9")
     update_custom_state()
     update_size_note()
+    apply_preset_position()
+    update_preview()
+    lift_preview_above_settings(root, preview)
+    root.after(300, sync_setup_webcam)
+    root.update_idletasks()
 
     root.protocol("WM_DELETE_WINDOW", close_setup)
     root.mainloop()
+    stop_setup_webcam()
+    try:
+        preview.destroy()
+    except Exception:
+        pass
     return result
 
 
