@@ -1,14 +1,13 @@
 """
 Cursor-centered aspect-ratio border overlay for Windows.
 
-Shows a setup prompt (quality, microphone, frame size) with a live cyan
-preview of the chosen size, then records the screen inside that rectangle
-with the chosen microphone. Press Ctrl+Caps Lock to park the border.
+Shows a fullscreen setup window (quality, microphone, frame size, camera options)
+then records the screen inside that rectangle with the chosen microphone.
+Press Ctrl+Caps Lock to park the border.
 Press Ctrl+Caps Lock again to follow the pointer.
 Hold Ctrl+Shift and Right to zoom the border in, or Left to zoom out.
 Press Ctrl+Caps Lock to park the border (then drag the camera inside the frame).
-Customize all shortcuts in the setup window. Press Esc to stop and save.
-Press Esc to stop and save.
+Customize shortcuts from Settings in the setup window. Press Esc to stop and save.
 """
 
 from __future__ import annotations
@@ -217,6 +216,91 @@ UPDATE_MS = 8  # ~120 FPS — keeps cursor locked to box center
 ZOOM_RATE = 1.55  # size multiplier per second while arrow keys are held (smooth)
 ZOOM_MIN = 0.25
 ZOOM_MAX = 8.0
+
+# Setup window (fullscreen settings panel)
+SETUP_BG = "#0b0e14"
+SETUP_PANEL = "#12161f"
+SETUP_CARD = "#1a2030"
+SETUP_TEXT = "#eef2f8"
+SETUP_MUTED = "#8b95a8"
+SETUP_ACCENT = "#00d4ff"
+SETUP_ACCENT_HOVER = "#33e0ff"
+SETUP_BORDER = "#2a3344"
+SETUP_SIDEBAR_W = 500
+
+
+def configure_setup_theme(root: tk.Tk) -> ttk.Style:
+    root.configure(bg=SETUP_BG)
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure(".", background=SETUP_PANEL, foreground=SETUP_TEXT)
+    style.configure("Setup.TFrame", background=SETUP_PANEL)
+    style.configure("Setup.TLabel", background=SETUP_PANEL, foreground=SETUP_TEXT)
+    style.configure(
+        "SetupMuted.TLabel",
+        background=SETUP_PANEL,
+        foreground=SETUP_MUTED,
+        font=("Segoe UI", 9),
+    )
+    style.configure(
+        "SetupTitle.TLabel",
+        background=SETUP_PANEL,
+        foreground=SETUP_TEXT,
+        font=("Segoe UI", 11, "bold"),
+    )
+    style.configure(
+        "TCombobox",
+        fieldbackground=SETUP_CARD,
+        background=SETUP_CARD,
+        foreground=SETUP_TEXT,
+        arrowcolor=SETUP_TEXT,
+        bordercolor=SETUP_BORDER,
+    )
+    style.map("TCombobox", fieldbackground=[("readonly", SETUP_CARD)])
+    style.configure(
+        "TEntry",
+        fieldbackground=SETUP_CARD,
+        foreground=SETUP_TEXT,
+        insertcolor=SETUP_TEXT,
+        bordercolor=SETUP_BORDER,
+    )
+    style.configure(
+        "Horizontal.TScale",
+        background=SETUP_PANEL,
+        troughcolor=SETUP_CARD,
+    )
+    style.configure(
+        "TRadiobutton",
+        background=SETUP_PANEL,
+        foreground=SETUP_TEXT,
+        font=("Segoe UI", 10),
+    )
+    style.map(
+        "TRadiobutton",
+        background=[("active", SETUP_PANEL), ("selected", SETUP_PANEL)],
+    )
+    style.configure(
+        "TScrollbar",
+        background=SETUP_PANEL,
+        troughcolor=SETUP_BG,
+        bordercolor=SETUP_BORDER,
+        arrowcolor=SETUP_MUTED,
+    )
+    return style
+
+
+def setup_fullscreen_root(root: tk.Tk) -> None:
+    sw = int(root.winfo_screenwidth())
+    sh = int(root.winfo_screenheight())
+    root.geometry(f"{sw}x{sh}+0+0")
+    root.minsize(960, 640)
+    try:
+        root.state("zoomed")
+    except tk.TclError:
+        pass
 
 
 class POINT(ctypes.Structure):
@@ -1290,6 +1374,125 @@ def _camera_choices(
     return choices
 
 
+def open_shortcuts_settings(
+    parent: tk.Misc,
+    shortcut_vars: dict[str, tk.StringVar],
+) -> None:
+    """Modal editor for keyboard shortcuts."""
+    dialog = tk.Toplevel(parent)
+    dialog.title("Keyboard shortcuts")
+    dialog.configure(bg=SETUP_PANEL)
+    dialog.transient(parent)
+    dialog.grab_set()
+    dialog.resizable(False, False)
+    pad = {"padx": 20, "pady": 8}
+    tk.Label(
+        dialog,
+        text="Keyboard shortcuts",
+        font=("Segoe UI", 14, "bold"),
+        fg=SETUP_TEXT,
+        bg=SETUP_PANEL,
+    ).pack(anchor="w", **pad)
+    tk.Label(
+        dialog,
+        text="Examples: Ctrl+Caps, Ctrl+Shift+Right, Ctrl+Numpad7, Ctrl+0",
+        font=("Segoe UI", 9),
+        fg=SETUP_MUTED,
+        bg=SETUP_PANEL,
+    ).pack(anchor="w", padx=20, pady=(0, 12))
+    body = tk.Frame(dialog, bg=SETUP_PANEL)
+    body.pack(fill="both", expand=True, padx=16)
+    for key in DEFAULT_SHORTCUTS:
+        row = tk.Frame(body, bg=SETUP_PANEL)
+        row.pack(fill="x", pady=4)
+        tk.Label(
+            row,
+            text=SHORTCUT_LABELS[key],
+            font=("Segoe UI", 10),
+            fg=SETUP_TEXT,
+            bg=SETUP_PANEL,
+            width=32,
+            anchor="w",
+        ).pack(side="left")
+        ttk.Entry(row, textvariable=shortcut_vars[key], width=24).pack(side="left", padx=(8, 0))
+    tk.Button(
+        dialog,
+        text="Done",
+        font=("Segoe UI", 10, "bold"),
+        fg=SETUP_BG,
+        bg=SETUP_ACCENT,
+        relief="flat",
+        padx=20,
+        pady=8,
+        cursor="hand2",
+        command=dialog.destroy,
+    ).pack(pady=16)
+    dialog.update_idletasks()
+    w, h = dialog.winfo_width(), dialog.winfo_height()
+    px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+    py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+    dialog.geometry(f"+{max(0, px)}+{max(0, py)}")
+
+
+def _quality_combo_items() -> list[tuple[str, str]]:
+    return [(f"{p['label']} — {p['detail']}", key) for key, p in QUALITY_PRESETS.items()]
+
+
+def _fps_combo_items() -> list[tuple[str, int]]:
+    items: list[tuple[str, int]] = []
+    for fps in FPS_CHOICES:
+        label = f"{fps} fps"
+        if fps == 30:
+            label += " (recommended)"
+        items.append((label, fps))
+    return items
+
+
+def _shape_combo_items() -> list[tuple[str, str]]:
+    return [("Square (full frame)", "square"), ("Circle", "circle")]
+
+
+def _size_combo_items() -> list[tuple[str, str]]:
+    return [(CAMERA_SIZE_LABELS[k], k) for k in CAMERA_SIZES]
+
+
+def _position_combo_items() -> list[tuple[str, str]]:
+    return [(CAMERA_POSITION_LABELS[k], k) for k in CAMERA_POSITIONS]
+
+
+def _zoom_combo_items() -> list[tuple[str, float]]:
+    return [
+        ("0.5× zoom out", 0.5),
+        ("1.0× normal", 1.0),
+        ("1.25×", 1.25),
+        ("1.5×", 1.5),
+        ("2.0×", 2.0),
+        ("2.5×", 2.5),
+        ("3.0× close-up", 3.0),
+    ]
+
+
+def _rotation_combo_items() -> list[tuple[str, int]]:
+    return [
+        ("0° normal", 0),
+        ("90° right", 90),
+        ("180° upside down", 180),
+        ("270° left", 270),
+    ]
+
+
+def _ratio_combo_items(quality_key: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for ratio_key in ("16:9", "9:16"):
+        enc = size_for_quality(ratio_key, quality_key)
+        w, h = screen_fit(*enc)
+        fit = "" if (w, h) == enc else " (fits screen)"
+        label = "16:9 widescreen" if ratio_key == "16:9" else "9:16 vertical"
+        items.append((f"{label} — {w}×{h}{fit}", ratio_key))
+    items.append(("Custom width × height", "custom"))
+    return items
+
+
 def ask_setup_gui(
     mics: list[str],
     catalog: list[CameraDevice],
@@ -1299,171 +1502,74 @@ def ask_setup_gui(
     result: dict | None = None
     root = tk.Tk()
     root.title("Cursor Follower — Record")
-    root.resizable(False, False)
-    root.attributes("-topmost", True)
+    configure_setup_theme(root)
+    setup_fullscreen_root(root)
 
-    quality_var = tk.StringVar(value="hd")
-    fps_var = tk.IntVar(value=30)
-    ratio_var = tk.StringVar(value="16:9")
+    quality_items = _quality_combo_items()
+    quality_by_label = {lbl: key for lbl, key in quality_items}
+    default_quality = next(
+        lbl for lbl, key in quality_items if key == "hd"
+    )
+    quality_display = tk.StringVar(value=default_quality)
+
+    fps_items = _fps_combo_items()
+    fps_by_label = {lbl: fps for lbl, fps in fps_items}
+    default_fps = next(lbl for lbl, fps in fps_items if fps == 30)
+    fps_display = tk.StringVar(value=default_fps)
+
+    ratio_by_label: dict[str, str] = {}
+    ratio_display = tk.StringVar()
+
     custom_w = tk.StringVar(value="1920")
     custom_h = tk.StringVar(value="1080")
+
     mic_choices = _mic_choices(mics)
+    mic_by_label = {lbl: val for lbl, val in mic_choices}
     mic_display = tk.StringVar(value=mic_choices[0][0])
+
     camera_choices = _camera_choices(catalog, working_names)
+    camera_by_label = {lbl: val for lbl, val in camera_choices}
     camera_display = tk.StringVar(value=camera_choices[0][0])
-    camera_shape_var = tk.StringVar(value="square")
-    camera_size_var = tk.StringVar(value="medium")
-    camera_position_var = tk.StringVar(value="bottom_right")
-    camera_zoom_var = tk.DoubleVar(value=1.0)
-    camera_rotation_var = tk.IntVar(value=0)
-    size_note = tk.StringVar()
-    preview_holder: dict[str, CyanBorder | None] = {"ov": None}
-    cam_state: dict = {
-        "webcam": None,
-        "preview": None,
-        "encode_ox": None,
-        "encode_oy": None,
-        "use_custom": False,
-        "after_id": None,
+
+    shape_items = _shape_combo_items()
+    shape_by_label = {lbl: key for lbl, key in shape_items}
+    shape_display = tk.StringVar(value=shape_items[0][0])
+
+    size_items = _size_combo_items()
+    size_by_label = {lbl: key for lbl, key in size_items}
+    size_display = tk.StringVar(value=size_items[1][0])
+
+    position_items = _position_combo_items()
+    position_by_label = {lbl: key for lbl, key in position_items}
+    position_display = tk.StringVar(value=position_items[3][0])
+
+    zoom_items = _zoom_combo_items()
+    zoom_by_label = {lbl: val for lbl, val in zoom_items}
+    zoom_display = tk.StringVar(value=zoom_items[1][0])
+
+    rotation_items = _rotation_combo_items()
+    rotation_by_label = {lbl: val for lbl, val in rotation_items}
+    rotation_display = tk.StringVar(value=rotation_items[0][0])
+
+    shortcut_vars = {
+        key: tk.StringVar(value=DEFAULT_SHORTCUTS[key]) for key in DEFAULT_SHORTCUTS
     }
+    size_note = tk.StringVar()
 
-    def current_encode_size() -> tuple[int, int]:
-        qkey = quality_var.get()
-        chosen = ratio_var.get()
-        if chosen == "custom":
-            try:
-                return even(int(custom_w.get())), even(int(custom_h.get()))
-            except ValueError:
-                w, h = current_size_for("custom")
-                return max(w, 64), max(h, 64)
-        return size_for_quality(chosen, qkey)
+    def close_setup() -> None:
+        root.destroy()
 
-    def selected_camera_name() -> str | None:
-        label = camera_display.get()
-        name = next((val for lbl, val in camera_choices if lbl == label), NO_CAMERA)
-        if name == NO_CAMERA:
-            return None
-        return name
+    def quality_key() -> str:
+        return quality_by_label.get(quality_display.get(), "hd")
 
-    def stop_setup_webcam(keep_capture: bool = False) -> WebcamCapture | None:
-        aid = cam_state.get("after_id")
-        if aid:
-            try:
-                root.after_cancel(aid)
-            except Exception:
-                pass
-            cam_state["after_id"] = None
-        prev = cam_state.get("preview")
-        if prev is not None:
-            prev.destroy()
-            cam_state["preview"] = None
-        wc = cam_state.get("webcam")
-        if wc is not None:
-            if keep_capture:
-                cam_state["webcam"] = None
-                return wc
-            wc.stop()
-            cam_state["webcam"] = None
-        return None
+    def ratio_key() -> str:
+        return ratio_by_label.get(ratio_display.get(), "16:9")
 
-    def webcam_frame_dims() -> tuple[int | None, int | None]:
-        wc = cam_state.get("webcam")
-        if wc is None:
-            return None, None
-        frame = wc.get_frame()
-        if frame is None:
-            return None, None
-        return int(frame.shape[1]), int(frame.shape[0])
-
-    def apply_preset_position() -> None:
-        enc_w, enc_h = current_encode_size()
-        fw, fh = webcam_frame_dims()
-        disp_w, disp_h = (
-            overlay_source_dims(fw, fh, int(camera_rotation_var.get()))
-            if fw and fh
-            else (fw, fh)
-        )
-        _, _, ox, oy = camera_overlay_pixels(
-            enc_w,
-            enc_h,
-            camera_size_var.get(),
-            camera_position_var.get(),
-            frame_w=disp_w,
-            frame_h=disp_h,
-            zoom=float(camera_zoom_var.get()),
-            rotation_deg=int(camera_rotation_var.get()),
-        )
-        cam_state["encode_ox"] = ox
-        cam_state["encode_oy"] = oy
-
-    def on_camera_moved(ox: int, oy: int) -> None:
-        cam_state["encode_ox"] = ox
-        cam_state["encode_oy"] = oy
-        cam_state["use_custom"] = True
-
-    def on_camera_option_change(reset_position: bool = True) -> None:
-        if reset_position:
-            cam_state["use_custom"] = False
-            apply_preset_position()
-        tick_setup_camera()
-
-    def sync_setup_webcam() -> None:
-        stop_setup_webcam()
-        name = selected_camera_name()
-        ov = preview_holder.get("ov")
-        if ov is not None:
-            ov.clear_webcam_overlay()
-        if not name:
-            return
-        dev = find_camera(name, catalog)
-        if dev is None:
-            messagebox.showerror("Camera", f"Camera not found: {name}")
-            return
-        try:
-            cam_state["webcam"] = WebcamCapture.open_device(dev, catalog=catalog)
-            if not cam_state["use_custom"]:
-                apply_preset_position()
-            print(f"  Camera on: {name}")
-            tick_setup_camera()
-        except Exception as exc:  # noqa: BLE001
-            print(f"  Camera error: {exc}")
-            messagebox.showerror("Camera", f"Could not open camera:\n{exc}")
-
-    def tick_setup_camera() -> None:
-        aid = cam_state.get("after_id")
-        if aid:
-            try:
-                root.after_cancel(aid)
-            except Exception:
-                pass
-            cam_state["after_id"] = None
-        ov = preview_holder.get("ov")
-        wc = cam_state.get("webcam")
-        if ov is None or wc is None:
-            return
-        enc_w, enc_h = current_encode_size()
-        if not cam_state["use_custom"]:
-            apply_preset_position()
-        frame = wc.get_frame()
-        if frame is not None:
-            try:
-                ov.update_webcam_overlay(
-                    frame,
-                    enc_w,
-                    enc_h,
-                    int(cam_state["encode_ox"] or 0),
-                    int(cam_state["encode_oy"] or 0),
-                    camera_shape_var.get(),
-                    camera_size_var.get(),
-                    float(camera_zoom_var.get()),
-                    int(camera_rotation_var.get()),
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"  Webcam preview error: {exc}")
-        cam_state["after_id"] = root.after(33, tick_setup_camera)
+    def fps_value() -> int:
+        return fps_by_label.get(fps_display.get(), 30)
 
     def current_size_for(ratio: str) -> tuple[int, int]:
-        q = quality_var.get()
+        q = quality_key()
         if ratio == "custom":
             try:
                 raw_w, raw_h = even(int(custom_w.get())), even(int(custom_h.get()))
@@ -1474,457 +1580,307 @@ def ask_setup_gui(
             return screen_fit(raw_w, raw_h)
         return screen_fit(*size_for_quality(ratio, q))
 
-    def refresh_size_labels() -> None:
-        raw16 = size_for_quality("16:9", quality_var.get())
-        raw916 = size_for_quality("9:16", quality_var.get())
-        w16, h16 = screen_fit(*raw16)
-        w916, h916 = screen_fit(*raw916)
-        fit16 = "" if (w16, h16) == raw16 else "  (fits screen)"
-        fit916 = "" if (w916, h916) == raw916 else "  (fits screen)"
-        radio_169.config(text=f"16:9 widescreen   {w16} × {h16}{fit16}")
-        radio_916.config(text=f"9:16 vertical     {w916} × {h916}{fit916}")
-        if ratio_var.get() != "custom":
-            w, h = current_size_for(ratio_var.get())
-            custom_w.set(str(w))
-            custom_h.set(str(h))
-        qkey = quality_var.get()
-        q = QUALITY_PRESETS[qkey]
-        chosen = ratio_var.get()
-        w_now, h_now = current_size_for(chosen)
+    def current_encode_size() -> tuple[int, int]:
+        chosen = ratio_key()
         if chosen == "custom":
             try:
-                enc_w, enc_h = even(int(custom_w.get())), even(int(custom_h.get()))
+                return even(int(custom_w.get())), even(int(custom_h.get()))
             except ValueError:
-                enc_w, enc_h = w_now, h_now
-        else:
-            enc_w, enc_h = size_for_quality(chosen, qkey)
-        if w_now >= 64 and h_now >= 64:
-            extra = (
-                f"  Saved as {enc_w} × {enc_h}."
-                if (enc_w, enc_h) != (w_now, h_now)
-                else ""
-            )
-            size_note.set(
-                f"On screen: {w_now} × {h_now} px.{extra}  "
-                f"{fps_var.get()} fps ({q['label']})"
-            )
-        else:
-            size_note.set("Enter width and height (at least 64 × 64) to preview the window.")
-        custom_state = "normal" if ratio_var.get() == "custom" else "disabled"
-        entry_w.configure(state=custom_state)
-        entry_h.configure(state=custom_state)
-        update_preview()
+                w, h = current_size_for("custom")
+                return max(w, 64), max(h, 64)
+        return size_for_quality(chosen, quality_key())
 
-    pad = {"padx": 16, "pady": 4}
-    frm = ttk.Frame(root, padding=12)
-    frm.pack(fill="both", expand=True)
+    def refresh_ratio_dropdown(keep_key: str | None = None) -> None:
+        items = _ratio_combo_items(quality_key())
+        labels = []
+        ratio_by_label.clear()
+        for lbl, key in items:
+            labels.append(lbl)
+            ratio_by_label[lbl] = key
+        ratio_combo.configure(values=labels)
+        want = keep_key or ratio_key()
+        pick = next((lbl for lbl, key in items if key == want), items[0][0])
+        ratio_display.set(pick)
 
-    ttk.Label(frm, text="Start recording", font=("Segoe UI", 14, "bold")).grid(
-        row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 8)
-    )
+    def update_custom_state() -> None:
+        state = "normal" if ratio_key() == "custom" else "disabled"
+        entry_w.configure(state=state)
+        entry_h.configure(state=state)
 
-    ttk.Label(frm, text="1. Video quality", font=("Segoe UI", 10, "bold")).grid(
-        row=1, column=0, columnspan=3, sticky="w", **pad
-    )
-    q_row = 2
-    for key, preset in QUALITY_PRESETS.items():
-        ttk.Radiobutton(
-            frm,
-            text=f"{preset['label']}   —  {preset['detail']}",
-            variable=quality_var,
-            value=key,
-            command=refresh_size_labels,
-        ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
-        q_row += 1
+    def update_size_note() -> None:
+        chosen = ratio_key()
+        w_now, h_now = current_size_for(chosen)
+        if w_now < 64 or h_now < 64:
+            size_note.set("Enter width and height (at least 64 × 64).")
+            return
+        enc_w, enc_h = current_encode_size()
+        q = QUALITY_PRESETS[quality_key()]
+        extra = (
+            f"Saved as {enc_w} × {enc_h}."
+            if (enc_w, enc_h) != (w_now, h_now)
+            else ""
+        )
+        size_note.set(
+            f"On screen: {w_now} × {h_now} px. {extra} "
+            f"{fps_value()} fps ({q['label']})."
+        )
 
-    ttk.Label(frm, text="2. Frame rate", font=("Segoe UI", 10, "bold")).grid(
-        row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
-    )
-    q_row += 1
-    fps_row = ttk.Frame(frm)
-    fps_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
-    for fps_val in FPS_CHOICES:
-        extra = "  (recommended)" if fps_val == 30 else ""
-        ttk.Radiobutton(
-            fps_row,
-            text=f"{fps_val} fps{extra}",
-            variable=fps_var,
-            value=fps_val,
-            command=refresh_size_labels,
-        ).pack(side="left", padx=(0, 16))
-    q_row += 1
+    def on_settings_change(*_args: object) -> None:
+        update_custom_state()
+        update_size_note()
 
-    ttk.Label(frm, text="3. Microphone", font=("Segoe UI", 10, "bold")).grid(
-        row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
-    )
-    q_row += 1
-    mic_combo = ttk.Combobox(
-        frm,
-        textvariable=mic_display,
-        values=[c[0] for c in mic_choices],
-        state="readonly",
-        width=52,
-    )
-    mic_combo.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=2)
-    q_row += 1
-    if not mics:
-        ttk.Label(
-            frm,
-            text="No microphones found — recording will be screen-only unless you plug one in.",
-            foreground="#666666",
-        ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-        q_row += 1
-
-    ttk.Label(frm, text="4. Webcam overlay", font=("Segoe UI", 10, "bold")).grid(
-        row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
-    )
-    q_row += 1
-    cam_combo = ttk.Combobox(
-        frm,
-        textvariable=camera_display,
-        values=[c[0] for c in camera_choices],
-        state="readonly",
-        width=52,
-    )
-    cam_combo.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=2)
-    cam_combo.bind("<<ComboboxSelected>>", lambda _e: sync_setup_webcam())
-    q_row += 1
-    if not catalog:
-        ttk.Label(
-            frm,
-            text="No cameras found — connect a webcam or use DroidCam on your phone.",
-            foreground="#666666",
-        ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-        q_row += 1
-    else:
-        ttk.Label(
-            frm,
-            text="DroidCam: keep the PC client running with video streaming — we use the same feed.",
-            foreground="#666666",
-        ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-        q_row += 1
-
-    shape_row = ttk.Frame(frm)
-    shape_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
-    ttk.Label(shape_row, text="Shape:").pack(side="left", padx=(0, 8))
-    for shape in CAMERA_SHAPES:
-        label = "Circle" if shape == "circle" else "Square"
-        ttk.Radiobutton(
-            shape_row,
-            text=label,
-            variable=camera_shape_var,
-            value=shape,
-            command=lambda: on_camera_option_change(False),
-        ).pack(side="left", padx=(0, 12))
-    q_row += 1
-
-    size_row = ttk.Frame(frm)
-    size_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
-    ttk.Label(size_row, text="Size:").pack(side="left", padx=(0, 8))
-    for key in CAMERA_SIZES:
-        ttk.Radiobutton(
-            size_row,
-            text=CAMERA_SIZE_LABELS[key],
-            variable=camera_size_var,
-            value=key,
-            command=lambda: on_camera_option_change(False),
-        ).pack(side="left", padx=(0, 10))
-    q_row += 1
-
-    pos_row = ttk.Frame(frm)
-    pos_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
-    ttk.Label(pos_row, text="Position:").pack(side="left", padx=(0, 8))
-    for key in CAMERA_POSITIONS:
-        ttk.Radiobutton(
-            pos_row,
-            text=CAMERA_POSITION_LABELS[key],
-            variable=camera_position_var,
-            value=key,
-            command=lambda: on_camera_option_change(True),
-        ).pack(side="left", padx=(0, 8))
-    q_row += 1
-
-    zoom_row = ttk.Frame(frm)
-    zoom_row.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=(4, 2))
-    ttk.Label(zoom_row, text="Camera zoom:").pack(side="left", padx=(0, 8))
-    zoom_scale = ttk.Scale(
-        zoom_row,
-        from_=0.5,
-        to=3.0,
-        orient="horizontal",
-        variable=camera_zoom_var,
-        command=lambda _v: on_camera_option_change(False),
-    )
-    zoom_scale.pack(side="left", fill="x", expand=True, padx=(0, 8))
-    zoom_label = ttk.Label(zoom_row, text="1.0×")
-    zoom_label.pack(side="left")
-
-    def refresh_zoom_label(*_args: object) -> None:
-        zoom_label.config(text=f"{camera_zoom_var.get():.1f}×")
-
-    camera_zoom_var.trace_add("write", refresh_zoom_label)
-    q_row += 1
-
-    rot_row = ttk.Frame(frm)
-    rot_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=(4, 2))
-    ttk.Label(rot_row, text="Rotate:").pack(side="left", padx=(0, 8))
-    rot_label = ttk.Label(rot_row, text="0°")
-    rot_label.pack(side="right", padx=(8, 0))
-
-    def refresh_rotation_label(*_args: object) -> None:
-        rot_label.config(text=f"{int(camera_rotation_var.get()) % 360}°")
-
-    def set_rotation_deg(deg: int) -> None:
-        camera_rotation_var.set(int(deg) % 360)
-        on_camera_option_change(False)
-
-    def rotate_by(delta: int) -> None:
-        camera_rotation_var.set((int(camera_rotation_var.get()) + delta) % 360)
-        on_camera_option_change(False)
-
-    for text, cmd in (
-        ("← Left", lambda: rotate_by(-90)),
-        ("→ Right", lambda: rotate_by(90)),
-        ("↑ Up", lambda: set_rotation_deg(180)),
-        ("↓ Down", lambda: set_rotation_deg(0)),
-    ):
-        ttk.Button(rot_row, text=text, width=8, command=cmd).pack(side="left", padx=(0, 6))
-    camera_rotation_var.trace_add("write", refresh_rotation_label)
-    q_row += 1
-    ttk.Label(
-        frm,
-        text="Left/Right turn 90°. Up = upside down (180°). Down = normal (0°).",
-        foreground="#666666",
-    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-    q_row += 1
-    ttk.Label(
-        frm,
-        text="Zoom crops from the center — use Square shape for the full phone frame.",
-        foreground="#666666",
-    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-    q_row += 1
-    ttk.Label(
-        frm,
-        text="Drag the webcam inside the cyan box to reposition it.",
-        foreground="#666666",
-    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-    q_row += 1
-
-    ttk.Label(frm, text="5. Keyboard shortcuts", font=("Segoe UI", 10, "bold")).grid(
-        row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
-    )
-    q_row += 1
-    shortcut_vars: dict[str, tk.StringVar] = {
-        key: tk.StringVar(value=DEFAULT_SHORTCUTS[key]) for key in DEFAULT_SHORTCUTS
-    }
-    for key in DEFAULT_SHORTCUTS:
-        row = ttk.Frame(frm)
-        row.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=1)
-        ttk.Label(row, text=SHORTCUT_LABELS[key], width=28).pack(side="left")
-        ttk.Entry(row, textvariable=shortcut_vars[key], width=22).pack(side="left", padx=(8, 0))
-        q_row += 1
-    ttk.Label(
-        frm,
-        text="Examples: Ctrl+Caps, Ctrl+Shift+Right, Ctrl+Numpad7, Ctrl+0",
-        foreground="#666666",
-    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-    q_row += 1
-
-    ttk.Label(frm, text="6. Frame size (the following border)", font=("Segoe UI", 10, "bold")).grid(
-        row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
-    )
-    q_row += 1
-    radio_169 = ttk.Radiobutton(
-        frm, variable=ratio_var, value="16:9", command=refresh_size_labels
-    )
-    radio_169.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
-    q_row += 1
-    radio_916 = ttk.Radiobutton(
-        frm, variable=ratio_var, value="9:16", command=refresh_size_labels
-    )
-    radio_916.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
-    q_row += 1
-
-    custom_row = ttk.Frame(frm)
-    custom_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
-    ttk.Radiobutton(
-        custom_row,
-        text="Custom",
-        variable=ratio_var,
-        value="custom",
-        command=refresh_size_labels,
-    ).pack(side="left")
-    entry_w = ttk.Entry(custom_row, textvariable=custom_w, width=7)
-    entry_w.pack(side="left", padx=(10, 4))
-    ttk.Label(custom_row, text="×").pack(side="left")
-    entry_h = ttk.Entry(custom_row, textvariable=custom_h, width=7)
-    entry_h.pack(side="left", padx=4)
-    ttk.Label(custom_row, text="pixels").pack(side="left")
-    q_row += 1
-
-    ttk.Label(frm, textvariable=size_note, foreground="#444444").grid(
-        row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 2)
-    )
-    q_row += 1
-    ttk.Label(
-        frm,
-        text="Red rec dot sits in the bottom-left corner. Hover for Start / Stop / Refresh / Exit. 3-2-1 before Start only; Stop is instant.",
-        foreground="#444444",
-    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
-    q_row += 1
+    def on_quality_change(_event: object = None) -> None:
+        refresh_ratio_dropdown()
+        on_settings_change()
 
     def start() -> None:
         nonlocal result
-        ratio = ratio_var.get()
-        quality = quality_var.get()
-        if ratio == "custom":
-            try:
-                native_w = even(int(custom_w.get().strip()))
-                native_h = even(int(custom_h.get().strip()))
-            except ValueError:
-                messagebox.showerror("Invalid size", "Custom width and height must be whole numbers.")
-                return
-            if native_w < 64 or native_h < 64:
-                messagebox.showerror("Invalid size", "Custom size must be at least 64 × 64.")
-                return
-            if native_w > 7680 or native_h > 7680:
-                messagebox.showerror("Invalid size", "Custom size must be 7680 × 7680 or smaller.")
-                return
-            width, height = screen_fit(native_w, native_h)
-            encode_w, encode_h = native_w, native_h
-            ratio_label = f"{native_w}:{native_h}"
-        else:
-            encode_w, encode_h = size_for_quality(ratio, quality)
-            width, height = screen_fit(encode_w, encode_h)
-            ratio_label = ratio
-
-        display = mic_display.get()
-        mic_name = next((val for label, val in mic_choices if label == display), NO_AUDIO)
-        if mic_name == NO_AUDIO:
-            mic_name = None
-
-        cam_label = camera_display.get()
-        camera_name = next(
-            (val for label, val in camera_choices if label == cam_label), NO_CAMERA
-        )
-        if camera_name == NO_CAMERA:
-            camera_name = None
-
-        result = {
-            "quality": quality,
-            "fps": int(fps_var.get()),
-            "ratio": ratio_label,
-            "width": width,
-            "height": height,
-            "encode_width": encode_w,
-            "encode_height": encode_h,
-            "mic_name": mic_name,
-            "camera_name": camera_name,
-            "camera_shape": camera_shape_var.get(),
-            "camera_size": camera_size_var.get(),
-            "camera_position": camera_position_var.get(),
-            "camera_ox": cam_state.get("encode_ox"),
-            "camera_oy": cam_state.get("encode_oy"),
-            "camera_zoom": float(camera_zoom_var.get()),
-            "camera_rotation": int(camera_rotation_var.get()) % 360,
-            "shortcuts": {k: v.get().strip() for k, v in shortcut_vars.items()},
-            "webcam_capture": stop_setup_webcam(keep_capture=True),
-            "record": True,
-        }
-        try:
-            preview.destroy()
-        except Exception:
-            pass
-        root.destroy()
-
-    btns = ttk.Frame(frm)
-    btns.grid(row=q_row, column=0, columnspan=3, sticky="e", pady=(12, 4), padx=8)
-    ttk.Button(btns, text="Cancel", command=lambda: (stop_setup_webcam(), root.destroy())).pack(
-        side="right", padx=4
-    )
-    ttk.Button(btns, text="Start recording", command=start).pack(side="right", padx=4)
-
-    def update_preview() -> None:
-        w, h = current_size_for(ratio_var.get())
+        w, h = current_size_for(ratio_key())
         if w < 64 or h < 64:
-            return
-        ov = preview_holder["ov"]
-        if ov is None:
-            return
-        if ov.box_w != w or ov.box_h != h:
-            ov.set_size(w, h)
-        ov.center_on_screen()
-        ov.lift_behind(root)
-
-    w0, h0 = size_for_quality("16:9", quality_var.get())
-    preview = CyanBorder(root, w0, h0, BORDER_WIDTH, show_label=True)
-    preview_holder["ov"] = preview
-
-    drag_state: dict[str, bool | None] = {"active": False}
-
-    def on_preview_press(event: tk.Event) -> None:
-        if cam_state.get("webcam") is None:
-            return
-        drag_state["active"] = True
-
-    def on_preview_drag(event: tk.Event) -> None:
-        if not drag_state.get("active"):
-            return
-        ov = preview_holder.get("ov")
-        if ov is None:
+            size_note.set("Frame must be at least 64 × 64 pixels.")
             return
         enc_w, enc_h = current_encode_size()
-        fw, fh = webcam_frame_dims()
-        disp_w, disp_h = (
-            overlay_source_dims(fw, fh, int(camera_rotation_var.get()))
-            if fw and fh
-            else (fw, fh)
-        )
-        cam_w, cam_h, _, _ = camera_overlay_pixels(
+        cam_name = camera_by_label.get(camera_display.get(), NO_CAMERA)
+        if cam_name == NO_CAMERA:
+            cam_name = None
+        _, _, ox, oy = camera_overlay_pixels(
             enc_w,
             enc_h,
-            camera_size_var.get(),
-            camera_position_var.get(),
-            frame_w=disp_w,
-            frame_h=disp_h,
-            zoom=float(camera_zoom_var.get()),
-            rotation_deg=int(camera_rotation_var.get()),
+            size_by_label.get(size_display.get(), "medium"),
+            position_by_label.get(position_display.get(), "bottom_right"),
         )
-        ox = int(round(event.x * enc_w / max(1, ov.box_w)))
-        oy = int(round(event.y * enc_h / max(1, ov.box_h)))
-        ox = max(0, min(ox, enc_w - cam_w))
-        oy = max(0, min(oy, enc_h - cam_h))
-        on_camera_moved(ox, oy)
+        shortcuts = {
+            key: shortcut_vars[key].get().strip() for key in DEFAULT_SHORTCUTS
+        }
+        result = {
+            "quality": quality_key(),
+            "fps": fps_value(),
+            "ratio": ratio_key(),
+            "width": w,
+            "height": h,
+            "encode_width": enc_w,
+            "encode_height": enc_h,
+            "mic_name": mic_by_label.get(mic_display.get(), mic_choices[0][1]),
+            "camera_name": cam_name,
+            "camera_shape": shape_by_label.get(shape_display.get(), "square"),
+            "camera_size": size_by_label.get(size_display.get(), "medium"),
+            "camera_position": position_by_label.get(
+                position_display.get(), "bottom_right"
+            ),
+            "camera_ox": ox,
+            "camera_oy": oy,
+            "camera_zoom": zoom_by_label.get(zoom_display.get(), 1.0),
+            "camera_rotation": rotation_by_label.get(
+                rotation_display.get(), 0
+            ),
+            "shortcuts": shortcuts,
+            "webcam_capture": None,
+            "record": True,
+        }
+        root.destroy()
 
-    def on_preview_release(_event: tk.Event) -> None:
-        drag_state["active"] = False
+    outer = tk.Frame(root, bg=SETUP_BG)
+    outer.pack(fill="both", expand=True)
 
-    preview.canvas.bind("<ButtonPress-1>", on_preview_press)
-    preview.canvas.bind("<B1-Motion>", on_preview_drag)
-    preview.canvas.bind("<ButtonRelease-1>", on_preview_release)
-    preview.canvas.configure(cursor="hand2")
+    center = tk.Frame(outer, bg=SETUP_BG)
+    center.place(relx=0.5, rely=0.48, anchor="center")
 
-    def on_custom_edit(*_args: object) -> None:
-        if ratio_var.get() == "custom":
-            update_preview()
+    card = tk.Frame(center, bg=SETUP_PANEL, padx=44, pady=36)
+    card.pack()
 
-    custom_w.trace_add("write", on_custom_edit)
-    custom_h.trace_add("write", on_custom_edit)
+    tk.Label(
+        card,
+        text="Cursor Follower",
+        font=("Segoe UI", 26, "bold"),
+        fg=SETUP_ACCENT,
+        bg=SETUP_PANEL,
+    ).pack(anchor="w")
+    tk.Label(
+        card,
+        text="Recording setup",
+        font=("Segoe UI", 12),
+        fg=SETUP_MUTED,
+        bg=SETUP_PANEL,
+    ).pack(anchor="w", pady=(4, 20))
 
-    refresh_size_labels()
-    preview.center_on_screen()
-    root.after(300, sync_setup_webcam)
-    root.update_idletasks()
-    root.geometry("+32+32")
-    root.lift()
-    root.attributes("-topmost", True)
-    root.protocol("WM_DELETE_WINDOW", lambda: (stop_setup_webcam(), root.destroy()))
+    form = tk.Frame(card, bg=SETUP_PANEL)
+    form.pack(fill="x")
+    form.columnconfigure(1, weight=1)
+
+    def add_row(row: int, label: str, widget: tk.Widget) -> None:
+        ttk.Label(form, text=label, style="Setup.TLabel").grid(
+            row=row, column=0, sticky="w", pady=9, padx=(0, 18)
+        )
+        widget.grid(row=row, column=1, sticky="ew", pady=9)
+
+    combo_width = 46
+
+    quality_combo = ttk.Combobox(
+        form,
+        textvariable=quality_display,
+        values=[lbl for lbl, _ in quality_items],
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(0, "Video quality", quality_combo)
+
+    fps_combo = ttk.Combobox(
+        form,
+        textvariable=fps_display,
+        values=[lbl for lbl, _ in fps_items],
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(1, "Frame rate", fps_combo)
+
+    mic_combo = ttk.Combobox(
+        form,
+        textvariable=mic_display,
+        values=[lbl for lbl, _ in mic_choices],
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(2, "Microphone", mic_combo)
+
+    camera_combo = ttk.Combobox(
+        form,
+        textvariable=camera_display,
+        values=[lbl for lbl, _ in camera_choices],
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(3, "Web camera", camera_combo)
+
+    ratio_combo = ttk.Combobox(
+        form,
+        textvariable=ratio_display,
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(4, "Frame size", ratio_combo)
+
+    custom_row = tk.Frame(form, bg=SETUP_PANEL)
+    custom_row.grid(row=5, column=1, sticky="w", pady=(0, 4))
+    ttk.Label(custom_row, text="Width", style="Setup.TLabel").pack(side="left")
+    entry_w = ttk.Entry(custom_row, textvariable=custom_w, width=8)
+    entry_w.pack(side="left", padx=(6, 16))
+    ttk.Label(custom_row, text="Height", style="Setup.TLabel").pack(side="left")
+    entry_h = ttk.Entry(custom_row, textvariable=custom_h, width=8)
+    entry_h.pack(side="left", padx=(6, 0))
+
+    shape_combo = ttk.Combobox(
+        form,
+        textvariable=shape_display,
+        values=[lbl for lbl, _ in shape_items],
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(6, "Camera shape", shape_combo)
+
+    size_combo = ttk.Combobox(
+        form,
+        textvariable=size_display,
+        values=[lbl for lbl, _ in size_items],
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(7, "Camera size", size_combo)
+
+    position_combo = ttk.Combobox(
+        form,
+        textvariable=position_display,
+        values=[lbl for lbl, _ in position_items],
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(8, "Camera position", position_combo)
+
+    zoom_combo = ttk.Combobox(
+        form,
+        textvariable=zoom_display,
+        values=[lbl for lbl, _ in zoom_items],
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(9, "Camera zoom", zoom_combo)
+
+    rotation_combo = ttk.Combobox(
+        form,
+        textvariable=rotation_display,
+        values=[lbl for lbl, _ in rotation_items],
+        state="readonly",
+        width=combo_width,
+    )
+    add_row(10, "Camera rotation", rotation_combo)
+
+    tk.Label(
+        form,
+        textvariable=size_note,
+        font=("Segoe UI", 9),
+        fg=SETUP_MUTED,
+        bg=SETUP_PANEL,
+        wraplength=520,
+        justify="left",
+    ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+    footer = tk.Frame(card, bg=SETUP_PANEL)
+    footer.pack(fill="x", pady=(28, 0))
+
+    tk.Button(
+        footer,
+        text="Settings",
+        font=("Segoe UI", 10),
+        fg=SETUP_TEXT,
+        bg=SETUP_CARD,
+        activebackground=SETUP_BORDER,
+        relief="flat",
+        padx=16,
+        pady=8,
+        cursor="hand2",
+        command=lambda: open_shortcuts_settings(root, shortcut_vars),
+    ).pack(side="left")
+
+    tk.Button(
+        footer,
+        text="Cancel",
+        font=("Segoe UI", 10),
+        fg=SETUP_TEXT,
+        bg=SETUP_CARD,
+        activebackground=SETUP_BORDER,
+        relief="flat",
+        padx=16,
+        pady=8,
+        cursor="hand2",
+        command=close_setup,
+    ).pack(side="right", padx=(8, 0))
+
+    tk.Button(
+        footer,
+        text="Start recording",
+        font=("Segoe UI", 11, "bold"),
+        fg=SETUP_BG,
+        bg=SETUP_ACCENT,
+        activebackground=SETUP_ACCENT_HOVER,
+        activeforeground=SETUP_BG,
+        relief="flat",
+        padx=22,
+        pady=10,
+        cursor="hand2",
+        command=start,
+    ).pack(side="right")
+
+    quality_combo.bind("<<ComboboxSelected>>", on_quality_change)
+    ratio_combo.bind("<<ComboboxSelected>>", lambda _e: on_settings_change())
+    fps_combo.bind("<<ComboboxSelected>>", lambda _e: on_settings_change())
+    custom_w.trace_add("write", on_settings_change)
+    custom_h.trace_add("write", on_settings_change)
+
+    refresh_ratio_dropdown("16:9")
+    update_custom_state()
+    update_size_note()
+
+    root.protocol("WM_DELETE_WINDOW", close_setup)
     root.mainloop()
-    stop_setup_webcam()
-    try:
-        preview.destroy()
-    except Exception:
-        pass
     return result
 
 
