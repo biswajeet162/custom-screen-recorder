@@ -13,7 +13,8 @@ echo   A setup window will ask for:
 echo     1. Video quality   (Low / HD / 2K / 4K)
 echo     2. Frame rate      (24 / 30 / 60 fps)
 echo     3. Microphone
-echo     4. Frame size      (16:9 / 9:16 / custom)
+echo     4. Webcam overlay  (camera, shape, position, size)
+echo     5. Frame size      (16:9 / 9:16 / custom)
 echo.
 echo   The cyan box stays on screen. Zoom toward a corner and those edges stick.
 echo   Pick 16:9, 9:16, or custom to see that size immediately.
@@ -27,11 +28,11 @@ echo   Start waits 3-2-1. Stop is immediate. Exit saves the video and quits.
 echo.
 
 where py >nul 2>&1 && (
-  py -3 -c "import mss,numpy,imageio_ffmpeg" 2>nul || py -3 -m pip install -r "%~dp0requirements.txt"
+  py -3 -c "import mss,numpy,imageio_ffmpeg,cv2,PIL" 2>nul || py -3 -m pip install -r "%~dp0requirements.txt"
   py -3 "%~dp0cursor_border.py"
   goto after
 )
-python -c "import mss,numpy,imageio_ffmpeg" 2>nul || python -m pip install -r "%~dp0requirements.txt"
+python -c "import mss,numpy,imageio_ffmpeg,cv2,PIL" 2>nul || python -m pip install -r "%~dp0requirements.txt"
 python "%~dp0cursor_border.py"
 
 :after

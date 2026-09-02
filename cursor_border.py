@@ -38,16 +38,28 @@ from tkinter import messagebox, ttk
 
 from recorder import (
     NO_AUDIO,
+    NO_CAMERA,
     FPS_CHOICES,
+    CAMERA_POSITION_LABELS,
+    CAMERA_POSITIONS,
+    CAMERA_SHAPES,
+    CAMERA_SIZE_LABELS,
+    CAMERA_SIZES,
     QUALITY_PRESETS,
     ScreenRecorder,
+    WebcamCapture,
+    camera_overlay_pixels,
     default_output_path,
     encoder_preset,
     ensure_recording_deps,
     even,
     find_ffmpeg,
+    list_cameras,
     list_microphones,
+    preferred_camera,
     preferred_microphone,
+    probe_cameras,
+    screen_camera_preview_rect,
     size_for_quality,
 )
 
@@ -317,6 +329,7 @@ class CyanBorder:
         self.last_pos: tuple[int, int] | None = None
         self.color = BORDER_COLOR
 
+        self._webcam_photo = None
         if master is None:
             self.win: tk.Misc = tk.Tk()
         else:
@@ -345,6 +358,10 @@ class CyanBorder:
             pass
         self._apply_pixel_size()
         self.redraw(self.color)
+        try:
+            self.canvas.tag_raise("webcam")
+        except tk.TclError:
+            pass
 
     def _apply_pixel_size(self, x: int | None = None, y: int | None = None) -> None:
         """Size/move with Win32 pixels (not Tk-scaled geometry)."""
@@ -409,7 +426,57 @@ class CyanBorder:
 
     @property
     def top_left(self) -> tuple[int, int]:
-        return self.last_pos if self.last_pos is not None else (0, 0)
+        if self.last_pos is not None:
+            return self.last_pos
+        try:
+            return int(self.win.winfo_rootx()), int(self.win.winfo_rooty())
+        except tk.TclError:
+            return 0, 0
+
+    def clear_webcam_overlay(self) -> None:
+        self.canvas.delete("webcam")
+        self._webcam_photo = None
+
+    def update_webcam_overlay(
+        self,
+        bgr_frame,
+        encode_w: int,
+        encode_h: int,
+        cam_ox: int,
+        cam_oy: int,
+        shape: str,
+        size_key: str,
+    ) -> None:
+        """Draw the webcam inside this border (matches the recorded overlay position)."""
+        import cv2
+        import numpy as np
+        from PIL import Image, ImageTk
+
+        if encode_w <= 0 or encode_h <= 0:
+            return
+        cam_w, cam_h, _, _ = camera_overlay_pixels(
+            encode_w, encode_h, size_key, "bottom_right", ox=cam_ox, oy=cam_oy
+        )
+        sw = max(32, int(self.box_w * cam_w / encode_w))
+        sh = max(32, int(self.box_h * cam_h / encode_h))
+        sx = max(0, min(int(self.box_w * cam_ox / encode_w), self.box_w - sw))
+        sy = max(0, min(int(self.box_h * cam_oy / encode_h), self.box_h - sh))
+        small = cv2.resize(bgr_frame, (sw, sh), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        if shape == "circle":
+            mask = np.zeros((sh, sw), dtype=np.float32)
+            radius = max(1, min(sw, sh) // 2 - 1)
+            cv2.circle(mask, (sw // 2, sh // 2), radius, 1.0, -1)
+            key = np.array([1, 1, 1], dtype=np.float32)
+            rgb = (
+                rgb.astype(np.float32) * mask[:, :, None]
+                + key * (1.0 - mask[:, :, None])
+            ).astype(np.uint8)
+        img = Image.fromarray(rgb)
+        self._webcam_photo = ImageTk.PhotoImage(img)
+        self.canvas.delete("webcam")
+        self.canvas.create_image(sx, sy, anchor="nw", image=self._webcam_photo, tags="webcam")
+        self.canvas.tag_raise("webcam")
 
     def follow_center(self, cx: int, cy: int) -> tuple[int, int]:
         """Place the box around (cx, cy), keeping the near screen edges stuck on-screen."""
@@ -745,6 +812,225 @@ class RecordHud:
             pass
 
 
+class WebcamPreview:
+    """Live webcam preview on the capture box (excluded from recording)."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        shape: str,
+        size_key: str,
+        position_key: str,
+        *,
+        draggable: bool = False,
+        encode_ox: int | None = None,
+        encode_oy: int | None = None,
+        on_moved=None,
+    ) -> None:
+        self.shape = shape if shape in CAMERA_SHAPES else "circle"
+        self.size_key = size_key if size_key in CAMERA_SIZES else "medium"
+        self.position_key = (
+            position_key if position_key in CAMERA_POSITIONS else "bottom_right"
+        )
+        self.encode_ox = encode_ox
+        self.encode_oy = encode_oy
+        self.draggable = draggable
+        self._on_moved = on_moved
+        self._drag: dict[str, int] | None = None
+        self._box: tuple[int, int, int, int, int, int] | None = None
+        self.win = tk.Toplevel(master)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.configure(bg="#1a1a1a")
+        self.canvas = tk.Canvas(
+            self.win, bg="#1a1a1a", highlightthickness=0, bd=0
+        )
+        self.canvas.pack()
+        self.hwnd = 0
+        self._photo = None
+        self._last_geom: tuple[int, int, int, int] | None = None
+        if draggable:
+            self.canvas.configure(cursor="hand2")
+            self.canvas.bind("<ButtonPress-1>", self._drag_start)
+            self.canvas.bind("<B1-Motion>", self._drag_motion)
+            self.canvas.bind("<ButtonRelease-1>", self._drag_end)
+        self.win.update_idletasks()
+        self.win.update()
+        self.hwnd = get_hwnd(self.win)
+        setup_hud_window(self.hwnd)
+
+    def set_options(
+        self,
+        shape: str,
+        size_key: str,
+        position_key: str,
+        encode_ox: int | None = None,
+        encode_oy: int | None = None,
+    ) -> None:
+        self.shape = shape if shape in CAMERA_SHAPES else self.shape
+        self.size_key = size_key if size_key in CAMERA_SIZES else self.size_key
+        self.position_key = (
+            position_key if position_key in CAMERA_POSITIONS else self.position_key
+        )
+        if encode_ox is not None and encode_oy is not None:
+            self.encode_ox = int(encode_ox)
+            self.encode_oy = int(encode_oy)
+        self._last_geom = None
+
+    def place_on_box(
+        self,
+        box_x: int,
+        box_y: int,
+        box_w: int,
+        box_h: int,
+        encode_w: int,
+        encode_h: int,
+    ) -> None:
+        self._box = (box_x, box_y, box_w, box_h, encode_w, encode_h)
+        x, y, w, h = screen_camera_preview_rect(
+            box_x,
+            box_y,
+            box_w,
+            box_h,
+            encode_w,
+            encode_h,
+            self.size_key,
+            self.position_key,
+            ox=self.encode_ox,
+            oy=self.encode_oy,
+        )
+        key = (x, y, w, h)
+        if self._last_geom == key:
+            return
+        self._last_geom = key
+        self.canvas.config(width=w, height=h)
+        if self.hwnd:
+            user32.SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        else:
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def lift_above(self, other_win: tk.Misc) -> None:
+        try:
+            other_hwnd = get_hwnd(other_win)
+            user32.SetWindowPos(
+                self.hwnd,
+                other_hwnd,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        except Exception:
+            pass
+
+    def _drag_start(self, event: tk.Event) -> None:
+        self._drag = {"x": int(event.x_root), "y": int(event.y_root)}
+
+    def _drag_motion(self, event: tk.Event) -> None:
+        if self._drag is None or self._box is None:
+            return
+        dx = int(event.x_root) - self._drag["x"]
+        dy = int(event.y_root) - self._drag["y"]
+        self._drag["x"] = int(event.x_root)
+        self._drag["y"] = int(event.y_root)
+        try:
+            nx = int(self.win.winfo_x()) + dx
+            ny = int(self.win.winfo_y()) + dy
+        except tk.TclError:
+            return
+        box_x, box_y, box_w, box_h, enc_w, enc_h = self._box
+        cam_w, cam_h, _, _ = camera_overlay_pixels(
+            enc_w, enc_h, self.size_key, self.position_key
+        )
+        screen_w = max(48, int(box_w * cam_w / enc_w))
+        screen_h = max(48, int(box_h * cam_h / enc_h))
+        min_x = box_x
+        min_y = box_y
+        max_x = box_x + box_w - screen_w
+        max_y = box_y + box_h - screen_h
+        nx = max(min_x, min(nx, max_x))
+        ny = max(min_y, min(ny, max_y))
+        self._last_geom = None
+        if self.hwnd:
+            user32.SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                nx,
+                ny,
+                screen_w,
+                screen_h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        else:
+            self.win.geometry(f"{screen_w}x{screen_h}+{nx}+{ny}")
+
+    def _drag_end(self, _event: tk.Event) -> None:
+        self._drag = None
+        if self._box is None:
+            return
+        box_x, box_y, box_w, box_h, enc_w, enc_h = self._box
+        try:
+            sx = int(self.win.winfo_x())
+            sy = int(self.win.winfo_y())
+        except tk.TclError:
+            return
+        cam_w, cam_h, _, _ = camera_overlay_pixels(
+            enc_w, enc_h, self.size_key, self.position_key
+        )
+        ox = int(round((sx - box_x) * enc_w / box_w))
+        oy = int(round((sy - box_y) * enc_h / box_h))
+        ox = max(0, min(ox, enc_w - cam_w))
+        oy = max(0, min(oy, enc_h - cam_h))
+        self.encode_ox = ox
+        self.encode_oy = oy
+        if self._on_moved is not None:
+            self._on_moved(ox, oy)
+
+    def refresh(self, webcam: WebcamCapture | None) -> None:
+        if webcam is None:
+            return
+        import cv2
+        from PIL import Image, ImageDraw, ImageTk
+
+        frame = webcam.get_frame()
+        if frame is None:
+            return
+        try:
+            w = max(8, int(self.canvas.winfo_width()))
+            h = max(8, int(self.canvas.winfo_height()))
+        except tk.TclError:
+            return
+        if w < 8 or h < 8:
+            return
+        small = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+        if self.shape == "circle":
+            mask = Image.new("L", (w, h), 0)
+            draw = ImageDraw.Draw(mask)
+            draw.ellipse((0, 0, w - 1, h - 1), fill=255)
+            img = img.convert("RGBA")
+            img.putalpha(mask)
+        self._photo = ImageTk.PhotoImage(img)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+
+    def destroy(self) -> None:
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Record the screen inside a cursor-centered aspect-ratio border"
@@ -821,7 +1107,19 @@ def _mic_choices(mics: list[str]) -> list[tuple[str, str]]:
     return choices
 
 
-def ask_setup_gui(mics: list[str]) -> dict | None:
+def _camera_choices(cameras: list[str]) -> list[tuple[str, str]]:
+    choices: list[tuple[str, str]] = []
+    default = preferred_camera(cameras)
+    if default:
+        choices.append((f"Auto-detected: {default}", default))
+        for name in cameras:
+            if name != default:
+                choices.append((name, name))
+    choices.append(("No webcam overlay", NO_CAMERA))
+    return choices
+
+
+def ask_setup_gui(mics: list[str], cameras: list[str], all_cameras: list[str]) -> dict | None:
     """Quality / microphone / frame-size window. None if the user cancels."""
     result: dict | None = None
     root = tk.Tk()
@@ -836,7 +1134,135 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     custom_h = tk.StringVar(value="1080")
     mic_choices = _mic_choices(mics)
     mic_display = tk.StringVar(value=mic_choices[0][0])
+    camera_choices = _camera_choices(cameras)
+    camera_display = tk.StringVar(value=camera_choices[0][0])
+    camera_shape_var = tk.StringVar(value="circle")
+    camera_size_var = tk.StringVar(value="medium")
+    camera_position_var = tk.StringVar(value="bottom_right")
     size_note = tk.StringVar()
+    preview_holder: dict[str, CyanBorder | None] = {"ov": None}
+    cam_state: dict = {
+        "webcam": None,
+        "preview": None,
+        "encode_ox": None,
+        "encode_oy": None,
+        "use_custom": False,
+        "after_id": None,
+    }
+
+    def current_encode_size() -> tuple[int, int]:
+        qkey = quality_var.get()
+        chosen = ratio_var.get()
+        if chosen == "custom":
+            try:
+                return even(int(custom_w.get())), even(int(custom_h.get()))
+            except ValueError:
+                w, h = current_size_for("custom")
+                return max(w, 64), max(h, 64)
+        return size_for_quality(chosen, qkey)
+
+    def selected_camera_name() -> str | None:
+        label = camera_display.get()
+        name = next((val for lbl, val in camera_choices if lbl == label), NO_CAMERA)
+        if name == NO_CAMERA:
+            return None
+        return name
+
+    def stop_setup_webcam(keep_capture: bool = False) -> WebcamCapture | None:
+        aid = cam_state.get("after_id")
+        if aid:
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+            cam_state["after_id"] = None
+        prev = cam_state.get("preview")
+        if prev is not None:
+            prev.destroy()
+            cam_state["preview"] = None
+        wc = cam_state.get("webcam")
+        if wc is not None:
+            if keep_capture:
+                cam_state["webcam"] = None
+                return wc
+            wc.stop()
+            cam_state["webcam"] = None
+        return None
+
+    def apply_preset_position() -> None:
+        enc_w, enc_h = current_encode_size()
+        _, _, ox, oy = camera_overlay_pixels(
+            enc_w,
+            enc_h,
+            camera_size_var.get(),
+            camera_position_var.get(),
+        )
+        cam_state["encode_ox"] = ox
+        cam_state["encode_oy"] = oy
+
+    def on_camera_moved(ox: int, oy: int) -> None:
+        cam_state["encode_ox"] = ox
+        cam_state["encode_oy"] = oy
+        cam_state["use_custom"] = True
+
+    def on_camera_option_change(reset_position: bool = True) -> None:
+        if reset_position:
+            cam_state["use_custom"] = False
+            apply_preset_position()
+        tick_setup_camera()
+
+    def sync_setup_webcam() -> None:
+        stop_setup_webcam()
+        name = selected_camera_name()
+        ov = preview_holder.get("ov")
+        if ov is not None:
+            ov.clear_webcam_overlay()
+        if not name:
+            return
+        if name not in all_cameras:
+            messagebox.showerror("Camera", f"Camera not found: {name}")
+            return
+        try:
+            idx = all_cameras.index(name)
+            cam_state["webcam"] = WebcamCapture.open(idx, name)
+            if not cam_state["use_custom"]:
+                apply_preset_position()
+            print(f"  Camera on: {name}")
+            tick_setup_camera()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Camera error: {exc}")
+            messagebox.showerror("Camera", f"Could not open camera:\n{exc}")
+
+    def tick_setup_camera() -> None:
+        aid = cam_state.get("after_id")
+        if aid:
+            try:
+                root.after_cancel(aid)
+            except Exception:
+                pass
+            cam_state["after_id"] = None
+        ov = preview_holder.get("ov")
+        wc = cam_state.get("webcam")
+        if ov is None or wc is None:
+            return
+        enc_w, enc_h = current_encode_size()
+        if not cam_state["use_custom"]:
+            apply_preset_position()
+        frame = wc.get_frame()
+        if frame is not None:
+            try:
+                ov.update_webcam_overlay(
+                    frame,
+                    enc_w,
+                    enc_h,
+                    int(cam_state["encode_ox"] or 0),
+                    int(cam_state["encode_oy"] or 0),
+                    camera_shape_var.get(),
+                    camera_size_var.get(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"  Webcam preview error: {exc}")
+        cam_state["after_id"] = root.after(33, tick_setup_camera)
 
     def current_size_for(ratio: str) -> tuple[int, int]:
         q = quality_var.get()
@@ -951,7 +1377,75 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
         ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
         q_row += 1
 
-    ttk.Label(frm, text="4. Frame size (the following border)", font=("Segoe UI", 10, "bold")).grid(
+    ttk.Label(frm, text="4. Webcam overlay", font=("Segoe UI", 10, "bold")).grid(
+        row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
+    )
+    q_row += 1
+    cam_combo = ttk.Combobox(
+        frm,
+        textvariable=camera_display,
+        values=[c[0] for c in camera_choices],
+        state="readonly",
+        width=52,
+    )
+    cam_combo.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=2)
+    cam_combo.bind("<<ComboboxSelected>>", lambda _e: sync_setup_webcam())
+    q_row += 1
+    if not cameras:
+        ttk.Label(
+            frm,
+            text="No cameras found — connect a webcam or use your laptop camera.",
+            foreground="#666666",
+        ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
+        q_row += 1
+
+    shape_row = ttk.Frame(frm)
+    shape_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    ttk.Label(shape_row, text="Shape:").pack(side="left", padx=(0, 8))
+    for shape in CAMERA_SHAPES:
+        label = "Circle" if shape == "circle" else "Square"
+        ttk.Radiobutton(
+            shape_row,
+            text=label,
+            variable=camera_shape_var,
+            value=shape,
+            command=lambda: on_camera_option_change(False),
+        ).pack(side="left", padx=(0, 12))
+    q_row += 1
+
+    size_row = ttk.Frame(frm)
+    size_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    ttk.Label(size_row, text="Size:").pack(side="left", padx=(0, 8))
+    for key in CAMERA_SIZES:
+        ttk.Radiobutton(
+            size_row,
+            text=CAMERA_SIZE_LABELS[key],
+            variable=camera_size_var,
+            value=key,
+            command=lambda: on_camera_option_change(False),
+        ).pack(side="left", padx=(0, 10))
+    q_row += 1
+
+    pos_row = ttk.Frame(frm)
+    pos_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    ttk.Label(pos_row, text="Position:").pack(side="left", padx=(0, 8))
+    for key in CAMERA_POSITIONS:
+        ttk.Radiobutton(
+            pos_row,
+            text=CAMERA_POSITION_LABELS[key],
+            variable=camera_position_var,
+            value=key,
+            command=lambda: on_camera_option_change(True),
+        ).pack(side="left", padx=(0, 8))
+    q_row += 1
+    ttk.Label(
+        frm,
+        text="Drag the webcam inside the cyan box to reposition it.",
+        foreground="#666666",
+    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
+    q_row += 1
+
+    ttk.Label(frm, text="5. Frame size (the following border)", font=("Segoe UI", 10, "bold")).grid(
         row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
     )
     q_row += 1
@@ -1024,6 +1518,13 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
         if mic_name == NO_AUDIO:
             mic_name = None
 
+        cam_label = camera_display.get()
+        camera_name = next(
+            (val for label, val in camera_choices if label == cam_label), NO_CAMERA
+        )
+        if camera_name == NO_CAMERA:
+            camera_name = None
+
         result = {
             "quality": quality,
             "fps": int(fps_var.get()),
@@ -1033,6 +1534,13 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
             "encode_width": encode_w,
             "encode_height": encode_h,
             "mic_name": mic_name,
+            "camera_name": camera_name,
+            "camera_shape": camera_shape_var.get(),
+            "camera_size": camera_size_var.get(),
+            "camera_position": camera_position_var.get(),
+            "camera_ox": cam_state.get("encode_ox"),
+            "camera_oy": cam_state.get("encode_oy"),
+            "webcam_capture": stop_setup_webcam(keep_capture=True),
             "record": True,
         }
         try:
@@ -1043,10 +1551,10 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
 
     btns = ttk.Frame(frm)
     btns.grid(row=q_row, column=0, columnspan=3, sticky="e", pady=(12, 4), padx=8)
-    ttk.Button(btns, text="Cancel", command=root.destroy).pack(side="right", padx=4)
+    ttk.Button(btns, text="Cancel", command=lambda: (stop_setup_webcam(), root.destroy())).pack(
+        side="right", padx=4
+    )
     ttk.Button(btns, text="Start recording", command=start).pack(side="right", padx=4)
-
-    preview_holder: dict[str, CyanBorder | None] = {"ov": None}
 
     def update_preview() -> None:
         w, h = current_size_for(ratio_var.get())
@@ -1064,6 +1572,40 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     preview = CyanBorder(root, w0, h0, BORDER_WIDTH, show_label=True)
     preview_holder["ov"] = preview
 
+    drag_state: dict[str, bool | None] = {"active": False}
+
+    def on_preview_press(event: tk.Event) -> None:
+        if cam_state.get("webcam") is None:
+            return
+        drag_state["active"] = True
+
+    def on_preview_drag(event: tk.Event) -> None:
+        if not drag_state.get("active"):
+            return
+        ov = preview_holder.get("ov")
+        if ov is None:
+            return
+        enc_w, enc_h = current_encode_size()
+        cam_w, cam_h, _, _ = camera_overlay_pixels(
+            enc_w,
+            enc_h,
+            camera_size_var.get(),
+            camera_position_var.get(),
+        )
+        ox = int(round(event.x * enc_w / max(1, ov.box_w)))
+        oy = int(round(event.y * enc_h / max(1, ov.box_h)))
+        ox = max(0, min(ox, enc_w - cam_w))
+        oy = max(0, min(oy, enc_h - cam_h))
+        on_camera_moved(ox, oy)
+
+    def on_preview_release(_event: tk.Event) -> None:
+        drag_state["active"] = False
+
+    preview.canvas.bind("<ButtonPress-1>", on_preview_press)
+    preview.canvas.bind("<B1-Motion>", on_preview_drag)
+    preview.canvas.bind("<ButtonRelease-1>", on_preview_release)
+    preview.canvas.configure(cursor="hand2")
+
     def on_custom_edit(*_args: object) -> None:
         if ratio_var.get() == "custom":
             update_preview()
@@ -1073,12 +1615,14 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
 
     refresh_size_labels()
     preview.center_on_screen()
+    root.after(300, sync_setup_webcam)
     root.update_idletasks()
     root.geometry("+32+32")
     root.lift()
     root.attributes("-topmost", True)
-    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.protocol("WM_DELETE_WINDOW", lambda: (stop_setup_webcam(), root.destroy()))
     root.mainloop()
+    stop_setup_webcam()
     try:
         preview.destroy()
     except Exception:
@@ -1086,7 +1630,7 @@ def ask_setup_gui(mics: list[str]) -> dict | None:
     return result
 
 
-def ask_setup_cli(mics: list[str]) -> dict | None:
+def ask_setup_cli(mics: list[str], cameras: list[str]) -> dict | None:
     print()
     print("  Cursor Follower — Record")
     print("  ------------------------")
@@ -1156,6 +1700,61 @@ def ask_setup_cli(mics: list[str]) -> dict | None:
         input("  Press Enter to continue...")
 
     print()
+    print("  Webcam overlay")
+    camera_name: str | None = None
+    camera_shape = "circle"
+    camera_size = "medium"
+    camera_position = "bottom_right"
+    if cameras:
+        default_cam = preferred_camera(cameras) or cameras[0]
+        default_cam_idx = cameras.index(default_cam) + 1
+        print(f"    Auto-detected: {default_cam}")
+        print()
+        for i, name in enumerate(cameras, start=1):
+            tag = "  [default]" if name == default_cam else ""
+            print(f"    {i}) {name}{tag}")
+        print(f"    {len(cameras) + 1}) No webcam overlay")
+        print()
+        while True:
+            raw = input(
+                f"  Choose camera [1-{len(cameras) + 1}] (default {default_cam_idx}): "
+            ).strip() or str(default_cam_idx)
+            try:
+                idx = int(raw)
+            except ValueError:
+                print("  Please enter a number from the list.")
+                continue
+            if 1 <= idx <= len(cameras):
+                camera_name = cameras[idx - 1]
+                break
+            if idx == len(cameras) + 1:
+                camera_name = None
+                break
+            print("  That number is not in the list.")
+        if camera_name:
+            print()
+            print("  Shape:  1) Circle   2) Square")
+            shape_raw = input("  Choose shape [1/2] (default 1): ").strip() or "1"
+            camera_shape = "square" if shape_raw == "2" else "circle"
+            print()
+            print("  Size:  1) Small   2) Medium   3) Large")
+            size_raw = input("  Choose size [1/2/3] (default 2): ").strip() or "2"
+            camera_size = {"1": "small", "2": "medium", "3": "large"}.get(size_raw, "medium")
+            print()
+            print("  Position:")
+            for i, key in enumerate(CAMERA_POSITIONS, start=1):
+                print(f"    {i}) {CAMERA_POSITION_LABELS[key]}")
+            pos_raw = input("  Choose position [1-4] (default 4): ").strip() or "4"
+            try:
+                pos_idx = int(pos_raw)
+                if 1 <= pos_idx <= len(CAMERA_POSITIONS):
+                    camera_position = CAMERA_POSITIONS[pos_idx - 1]
+            except ValueError:
+                pass
+    else:
+        print("    None found. No webcam overlay.")
+
+    print()
     enc16 = size_for_quality("16:9", quality)
     enc916 = size_for_quality("9:16", quality)
     w16, h16 = screen_fit(*enc16)
@@ -1202,11 +1801,22 @@ def ask_setup_cli(mics: list[str]) -> dict | None:
         "encode_width": encode_w,
         "encode_height": encode_h,
         "mic_name": mic_name,
+        "camera_name": camera_name,
+        "camera_shape": camera_shape,
+        "camera_size": camera_size,
+        "camera_position": camera_position,
+        "camera_ox": None,
+        "camera_oy": None,
         "record": True,
     }
 
 
-def resolve_session(args: argparse.Namespace, mics: list[str]) -> dict | None:
+def resolve_session(
+    args: argparse.Namespace,
+    mics: list[str],
+    cameras: list[str],
+    all_cameras: list[str],
+) -> dict | None:
     """Build a session dict from CLI flags, or open the setup prompt."""
     overlay_only = bool(args.overlay_only)
     fps = int(args.fps) if args.fps else 30
@@ -1229,6 +1839,12 @@ def resolve_session(args: argparse.Namespace, mics: list[str]) -> dict | None:
             "encode_width": encode_w,
             "encode_height": encode_h,
             "mic_name": None,
+            "camera_name": None,
+            "camera_shape": "circle",
+            "camera_size": "medium",
+            "camera_position": "bottom_right",
+            "camera_ox": None,
+            "camera_oy": None,
             "record": False,
         }
 
@@ -1258,12 +1874,18 @@ def resolve_session(args: argparse.Namespace, mics: list[str]) -> dict | None:
             "encode_width": encode_w,
             "encode_height": encode_h,
             "mic_name": mic_name,
+            "camera_name": preferred_camera(cameras),
+            "camera_shape": "circle",
+            "camera_size": "medium",
+            "camera_position": "bottom_right",
+            "camera_ox": None,
+            "camera_oy": None,
             "record": True,
         }
 
     if args.cli:
-        return ask_setup_cli(mics)
-    return ask_setup_gui(mics)
+        return ask_setup_cli(mics, cameras)
+    return ask_setup_gui(mics, cameras, all_cameras)
 
 
 # -----------------------------------------------------------------------------
@@ -1283,6 +1905,14 @@ def run(
     encode_width: int,
     encode_height: int,
     mic_name: str | None,
+    camera_name: str | None,
+    camera_shape: str,
+    camera_size: str,
+    camera_position: str,
+    camera_ox: int | None,
+    camera_oy: int | None,
+    all_cameras: list[str],
+    webcam_capture: WebcamCapture | None,
     ffmpeg: str | None,
 ) -> None:
     box_w, box_h = screen_fit(max(50, int(width)), max(50, int(height)))
@@ -1290,11 +1920,21 @@ def run(
     fps = int(fps) if fps in FPS_CHOICES else 30
     encode_w = even(max(64, int(encode_width)))
     encode_h = even(max(64, int(encode_height)))
+    camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "circle"
+    camera_size = camera_size if camera_size in CAMERA_SIZES else "medium"
+    camera_position = (
+        camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"
+    )
+    if camera_name and (camera_ox is None or camera_oy is None):
+        _, _, camera_ox, camera_oy = camera_overlay_pixels(
+            encode_w, encode_h, camera_size, camera_position
+        )
 
     overlay = CyanBorder(None, box_w, box_h, border_w, show_label=False)
     root = overlay.win
     recorder: ScreenRecorder | None = None
     hud: RecordHud | None = None
+    webcam: WebcamCapture | None = webcam_capture
     stopping = {"done": False}
     follow = {"locked": False, "center": get_cursor_pos(), "park_down": True}
     take = {"active": False, "frozen": 0.0, "clock": ""}
@@ -1304,6 +1944,22 @@ def run(
         "base_h": box_h,
         "clock": time.perf_counter(),
     }
+
+    if not camera_name and webcam is not None:
+        webcam.stop()
+        webcam = None
+
+    if camera_name and camera_name in all_cameras:
+        if webcam is None:
+            try:
+                cam_idx = all_cameras.index(camera_name)
+                webcam = WebcamCapture.open(cam_idx, camera_name)
+                print(f"  Webcam overlay: {camera_name}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  Could not open camera ({exc}). Continuing without webcam overlay.")
+                webcam = None
+        else:
+            print(f"  Webcam overlay: {camera_name} (from setup)")
 
     def get_frame() -> tuple[int, int, int, int]:
         """Center + current capture size (grows/shrinks with zoom, aspect locked)."""
@@ -1328,6 +1984,8 @@ def run(
             return
         overlay.set_size(w, h, fit_to_screen=False)
         place_overlay()
+        if webcam is not None:
+            overlay.clear_webcam_overlay()
 
     def move_to_cursor() -> None:
         if follow["locked"]:
@@ -1374,6 +2032,12 @@ def run(
             audio_bitrate=str(q["audio_bitrate"]),
             output_path=out,
             get_frame=get_frame,
+            webcam=webcam,
+            camera_shape=camera_shape,
+            camera_size=camera_size,
+            camera_position=camera_position,
+            camera_ox=camera_ox,
+            camera_oy=camera_oy,
         )
 
     def begin_take() -> bool:
@@ -1444,6 +2108,8 @@ def run(
             take["active"] = False
         if hud is not None:
             hud.destroy()
+        if webcam is not None:
+            webcam.stop()
         overlay.destroy()
         if saved:
             mins, secs = divmod(int(elapsed), 60)
@@ -1476,6 +2142,21 @@ def run(
 
         move_to_cursor()
         sync_hud()
+        if webcam is not None:
+            frame = webcam.get_frame()
+            if frame is not None:
+                try:
+                    overlay.update_webcam_overlay(
+                        frame,
+                        encode_w,
+                        encode_h,
+                        int(camera_ox or 0),
+                        int(camera_oy or 0),
+                        camera_shape,
+                        camera_size,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  Webcam preview error: {exc}")
         try:
             root.after(UPDATE_MS, tick)
         except tk.TclError:
@@ -1539,6 +2220,8 @@ def main() -> int:
 
     ffmpeg = None
     mics: list[str] = []
+    cameras: list[str] = []
+    working: list[str] = []
     if not args.overlay_only:
         try:
             ffmpeg = find_ffmpeg()
@@ -1550,12 +2233,26 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"  Could not list microphones ({exc}). Continuing without a default mic.")
             mics = []
+        try:
+            cameras = list_cameras(ffmpeg)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Could not list cameras ({exc}). Continuing without webcam overlay.")
+            cameras = []
+        working = probe_cameras(ffmpeg) if cameras else []
+        if working:
+            print(f"  Working cameras: {', '.join(working)}")
+        elif cameras:
+            print(f"  Cameras detected (not verified): {', '.join(cameras)}")
+            working = cameras
+        else:
+            print("  No cameras detected.")
+
         if mics:
             print(f"  Auto-detected microphone: {preferred_microphone(mics)}")
         else:
             print("  No microphones detected.")
 
-    session = resolve_session(args, mics)
+    session = resolve_session(args, mics, working, cameras)
     if session is None:
         print("  Cancelled.")
         return 0
@@ -1572,6 +2269,14 @@ def main() -> int:
             encode_width=int(session.get("encode_width") or session["width"]),
             encode_height=int(session.get("encode_height") or session["height"]),
             mic_name=session["mic_name"],
+            camera_name=session.get("camera_name"),
+            camera_shape=str(session.get("camera_shape") or "circle"),
+            camera_size=str(session.get("camera_size") or "medium"),
+            camera_position=str(session.get("camera_position") or "bottom_right"),
+            camera_ox=session.get("camera_ox"),
+            camera_oy=session.get("camera_oy"),
+            all_cameras=cameras,
+            webcam_capture=session.get("webcam_capture"),
             ffmpeg=ffmpeg,
         )
     except KeyboardInterrupt:

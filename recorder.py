@@ -67,6 +67,26 @@ FPS_CHOICES = (24, 30, 60)
 _HEIGHT_TO_WIDTH_16_9 = {720: 1280, 1080: 1920, 1440: 2560, 2160: 3840}
 
 NO_AUDIO = "__none__"
+NO_CAMERA = "__none__"
+
+CAMERA_SHAPES = ("square", "circle")
+CAMERA_POSITIONS = ("top_left", "top_right", "bottom_left", "bottom_right")
+CAMERA_SIZES: dict[str, float] = {
+    "small": 0.14,
+    "medium": 0.20,
+    "large": 0.28,
+}
+CAMERA_SIZE_LABELS = {
+    "small": "Small",
+    "medium": "Medium  (recommended)",
+    "large": "Large",
+}
+CAMERA_POSITION_LABELS = {
+    "top_left": "Top left",
+    "top_right": "Top right",
+    "bottom_left": "Bottom left",
+    "bottom_right": "Bottom right",
+}
 
 
 def even(n: int) -> int:
@@ -146,7 +166,66 @@ def list_microphones(ffmpeg: str | None = None) -> list[str]:
     return devices
 
 
+def probe_cameras(ffmpeg: str | None = None) -> list[str]:
+    """Return camera names that open and deliver a frame right now."""
+    import cv2
+
+    names = list_cameras(ffmpeg)
+    working: list[str] = []
+    for idx, name in enumerate(names):
+        for api in (cv2.CAP_DSHOW, cv2.CAP_MSMF):
+            cap = cv2.VideoCapture(idx, api)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            ok, frame = cap.read()
+            cap.release()
+            if ok and frame is not None:
+                working.append(name)
+                break
+        time.sleep(0.12)
+    return working
+
+
+def list_cameras(ffmpeg: str | None = None) -> list[str]:
+    """DirectShow video capture devices (Windows)."""
+    exe = ffmpeg or find_ffmpeg()
+    proc = subprocess.run(
+        [exe, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=CREATE_NO_WINDOW,
+    )
+    text = (proc.stderr or "") + (proc.stdout or "")
+    devices: list[str] = []
+    in_video_section = False
+    for line in text.splitlines():
+        lower = line.lower()
+        if "alternative name" in lower:
+            continue
+        if "directshow video devices" in lower:
+            in_video_section = True
+            continue
+        if "directshow audio devices" in lower:
+            in_video_section = False
+            continue
+        match = re.search(r'"([^"]+)"', line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if not name:
+            continue
+        tagged_video = bool(re.search(r"\(video\)\s*$", line.strip(), re.I))
+        if tagged_video or in_video_section:
+            if name not in devices:
+                devices.append(name)
+    return devices
+
+
 _LOOPBACK_HINTS = ("stereo mix", "what u hear", "loopback", "wave out")
+_CAMERA_SKIP_HINTS = ("obs", "virtual", "snap camera", "manycam", "avatar")
 
 
 def preferred_microphone(mics: list[str]) -> str | None:
@@ -156,6 +235,211 @@ def preferred_microphone(mics: list[str]) -> str | None:
         if not any(hint in lower for hint in _LOOPBACK_HINTS):
             return name
     return mics[0] if mics else None
+
+
+def preferred_camera(cameras: list[str]) -> str | None:
+    """Pick a built-in / webcam device when possible."""
+    for name in cameras:
+        lower = name.lower()
+        if any(hint in lower for hint in _CAMERA_SKIP_HINTS):
+            continue
+        if any(hint in lower for hint in ("integrated", "built-in", "facetime", "laptop", "hd user facing")):
+            return name
+    for name in cameras:
+        lower = name.lower()
+        if not any(hint in lower for hint in _CAMERA_SKIP_HINTS):
+            return name
+    return cameras[0] if cameras else None
+
+
+def camera_overlay_pixels(
+    out_w: int,
+    out_h: int,
+    size_key: str,
+    position_key: str,
+    ox: int | None = None,
+    oy: int | None = None,
+) -> tuple[int, int, int, int]:
+    """Return cam_w, cam_h, x, y on the encoded frame (square box)."""
+    frac = CAMERA_SIZES.get(size_key, CAMERA_SIZES["medium"])
+    cam_h = even(max(48, int(out_h * frac)))
+    cam_w = cam_h
+    margin = even(max(8, int(min(out_w, out_h) * 0.03)))
+    if ox is not None and oy is not None:
+        ox_i = max(0, min(int(ox), out_w - cam_w))
+        oy_i = max(0, min(int(oy), out_h - cam_h))
+        return cam_w, cam_h, ox_i, oy_i
+    if position_key == "top_left":
+        ox_i, oy_i = margin, margin
+    elif position_key == "top_right":
+        ox_i, oy_i = out_w - cam_w - margin, margin
+    elif position_key == "bottom_left":
+        ox_i, oy_i = margin, out_h - cam_h - margin
+    else:
+        ox_i, oy_i = out_w - cam_w - margin, out_h - cam_h - margin
+    ox_i = max(0, min(int(ox_i), out_w - cam_w))
+    oy_i = max(0, min(int(oy_i), out_h - cam_h))
+    return cam_w, cam_h, ox_i, oy_i
+
+
+def screen_camera_preview_rect(
+    box_x: int,
+    box_y: int,
+    box_w: int,
+    box_h: int,
+    encode_w: int,
+    encode_h: int,
+    size_key: str,
+    position_key: str,
+    ox: int | None = None,
+    oy: int | None = None,
+) -> tuple[int, int, int, int]:
+    """On-screen preview window matching the recorded overlay."""
+    cam_w, cam_h, ox_i, oy_i = camera_overlay_pixels(
+        encode_w, encode_h, size_key, position_key, ox=ox, oy=oy
+    )
+    if encode_w <= 0 or encode_h <= 0:
+        return box_x, box_y, 120, 120
+    screen_w = max(48, int(box_w * cam_w / encode_w))
+    screen_h = max(48, int(box_h * cam_h / encode_h))
+    screen_ox = int(box_x + box_w * ox_i / encode_w)
+    screen_oy = int(box_y + box_h * oy_i / encode_h)
+    return screen_ox, screen_oy, screen_w, screen_h
+
+
+def composite_webcam_onto(
+    dst,
+    cam_bgr,
+    cam_w: int,
+    cam_h: int,
+    ox: int,
+    oy: int,
+    shape: str,
+) -> None:
+    """Blend a resized webcam frame onto a BGR screen frame."""
+    import cv2
+    import numpy as np
+
+    dh, dw = dst.shape[:2]
+    if ox >= dw or oy >= dh or ox + cam_w <= 0 or oy + cam_h <= 0:
+        return
+    cam = cv2.resize(cam_bgr, (cam_w, cam_h), interpolation=cv2.INTER_AREA)
+    x0 = max(0, ox)
+    y0 = max(0, oy)
+    x1 = min(dw, ox + cam_w)
+    y1 = min(dh, oy + cam_h)
+    sx0 = x0 - ox
+    sy0 = y0 - oy
+    sx1 = sx0 + (x1 - x0)
+    sy1 = sy0 + (y1 - y0)
+    region = dst[y0:y1, x0:x1]
+    patch = cam[sy0:sy1, sx0:sx1]
+    if shape == "circle":
+        mask = np.zeros((patch.shape[0], patch.shape[1]), dtype=np.float32)
+        cx = patch.shape[1] / 2.0
+        cy = patch.shape[0] / 2.0
+        radius = min(patch.shape[0], patch.shape[1]) / 2.0 - 1.0
+        cv2.circle(mask, (int(cx), int(cy)), int(radius), 1.0, -1)
+        for c in range(3):
+            region[:, :, c] = (
+                patch[:, :, c] * mask + region[:, :, c] * (1.0 - mask)
+            ).astype(np.uint8)
+    else:
+        region[:, :, :] = patch
+
+
+class WebcamCapture:
+    """Threaded DirectShow webcam reader (one owner per device)."""
+
+    def __init__(self, device_index: int, device_name: str | None = None) -> None:
+        import cv2
+
+        self._lock = threading.Lock()
+        self._frame = None
+        self._stop = threading.Event()
+        self._device_index = int(device_index)
+        self._device_name = device_name
+        self._cap = None
+        self._api = cv2.CAP_DSHOW
+        for api in (cv2.CAP_DSHOW, cv2.CAP_MSMF):
+            cap = cv2.VideoCapture(int(device_index), api)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                self._cap = cap
+                self._api = api
+                with self._lock:
+                    self._frame = frame
+                break
+            cap.release()
+        if self._cap is None:
+            label = device_name or f"index {device_index}"
+            raise RuntimeError(f"Could not open camera {label}")
+        try:
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        self._thread: threading.Thread | None = None
+
+    @classmethod
+    def open(
+        cls,
+        device_index: int,
+        device_name: str | None = None,
+        *,
+        retries: int = 8,
+        delay_s: float = 0.5,
+    ) -> "WebcamCapture":
+        last_err: Exception | None = None
+        for attempt in range(max(1, retries)):
+            try:
+                cap = cls(device_index, device_name)
+                cap.start()
+                return cap
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                if attempt + 1 < retries:
+                    time.sleep(delay_s)
+        raise RuntimeError(str(last_err or "Could not open camera"))
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="webcam-capture", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            cap = self._cap
+            if cap is None or not cap.isOpened():
+                time.sleep(0.05)
+                continue
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                with self._lock:
+                    self._frame = frame
+            else:
+                time.sleep(0.02)
+
+    def get_frame(self):
+        with self._lock:
+            if self._frame is None:
+                return None
+            return self._frame.copy()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        try:
+            if self._cap is not None:
+                self._cap.release()
+        except Exception:
+            pass
+        self._cap = None
 
 
 def default_output_path(
@@ -183,6 +467,12 @@ class ScreenRecorder:
         audio_bitrate: str,
         output_path: Path,
         get_frame,
+        webcam: WebcamCapture | None = None,
+        camera_shape: str = "circle",
+        camera_size: str = "medium",
+        camera_position: str = "bottom_right",
+        camera_ox: int | None = None,
+        camera_oy: int | None = None,
     ) -> None:
         self.width = even(max(50, width))
         self.height = even(max(50, height))
@@ -193,6 +483,20 @@ class ScreenRecorder:
         self.audio_bitrate = audio_bitrate
         self.output_path = Path(output_path)
         self.get_frame = get_frame
+        self._webcam = webcam
+        self._camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "circle"
+        self._camera_size = camera_size if camera_size in CAMERA_SIZES else "medium"
+        self._camera_position = (
+            camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"
+        )
+        self._cam_w, self._cam_h, self._cam_x, self._cam_y = camera_overlay_pixels(
+            self.width,
+            self.height,
+            self._camera_size,
+            self._camera_position,
+            ox=camera_ox,
+            oy=camera_oy,
+        )
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -435,6 +739,18 @@ class ScreenRecorder:
                         frame = captured
                     else:
                         frame = _resize_bgr(captured, out_frame)
+                    if self._webcam is not None:
+                        cam_frame = self._webcam.get_frame()
+                        if cam_frame is not None:
+                            composite_webcam_onto(
+                                frame,
+                                cam_frame,
+                                self._cam_w,
+                                self._cam_h,
+                                self._cam_x,
+                                self._cam_y,
+                                self._camera_shape,
+                            )
                     payload = np.ascontiguousarray(frame).tobytes()
                     try:
                         self._frame_q.put_nowait(payload)
@@ -509,7 +825,7 @@ def _resize_bgr(src, dst):
 
 
 def ensure_recording_deps() -> None:
-    """Install mss / numpy / imageio-ffmpeg if missing (first-run convenience)."""
+    """Install capture/encode packages if missing (first-run convenience)."""
     missing: list[str] = []
     try:
         import mss  # noqa: F401
@@ -523,6 +839,14 @@ def ensure_recording_deps() -> None:
         import imageio_ffmpeg  # noqa: F401
     except ImportError:
         missing.append("imageio-ffmpeg")
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        missing.append("opencv-python-headless")
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        missing.append("Pillow")
     if not missing:
         return
     print("  Installing: " + ", ".join(missing) + " ...")
