@@ -235,6 +235,38 @@ def clamp_top_left(
     return int(x), int(y)
 
 
+def pin_box_top_left(
+    cx: int, cy: int, w: int, h: int, rect: tuple[int, int, int, int]
+) -> tuple[int, int]:
+    """Top-left of a w×h box aimed at (cx, cy), with near edges stuck on screen.
+
+    While the box fits, it stays fully on the monitor and follows the point
+    until an edge. If zoom makes it larger than the screen, the edges toward
+    (cx, cy) stick to that corner; overflow goes off the opposite sides.
+    """
+    left, top, right, bottom = rect
+    screen_w = right - left
+    screen_h = bottom - top
+    x = int(cx) - (int(w) // 2)
+    y = int(cy) - (int(h) // 2)
+
+    if w <= screen_w:
+        x = min(max(x, left), right - w)
+    else:
+        t = 0.0 if screen_w <= 0 else (int(cx) - left) / screen_w
+        t = min(max(t, 0.0), 1.0)
+        x = int(round(left + t * (screen_w - w)))
+
+    if h <= screen_h:
+        y = min(max(y, top), bottom - h)
+    else:
+        t = 0.0 if screen_h <= 0 else (int(cy) - top) / screen_h
+        t = min(max(t, 0.0), 1.0)
+        y = int(round(top + t * (screen_h - h)))
+
+    return int(x), int(y)
+
+
 def configured_size(ratio: str) -> tuple[int, int]:
     """Return (width, height) from the CONFIG block for overlay-only mode."""
     if ratio == "16:9":
@@ -381,17 +413,10 @@ class CyanBorder:
     def top_left(self) -> tuple[int, int]:
         return self.last_pos if self.last_pos is not None else (0, 0)
 
-    def follow_center(self, cx: int, cy: int, *, stay_on_screen: bool | None = None) -> tuple[int, int]:
-        """Place the box around (cx, cy). Clamps only while the box still fits on the monitor."""
-        x = cx - (self.box_w // 2)
-        y = cy - (self.box_h // 2)
+    def follow_center(self, cx: int, cy: int) -> tuple[int, int]:
+        """Place the box around (cx, cy), keeping the near screen edges stuck on-screen."""
         rect = monitor_rect_at(cx, cy)
-        mon_w = rect[2] - rect[0]
-        mon_h = rect[3] - rect[1]
-        if stay_on_screen is None:
-            stay_on_screen = self.box_w <= mon_w and self.box_h <= mon_h
-        if stay_on_screen:
-            x, y = clamp_top_left(x, y, self.box_w, self.box_h, rect)
+        x, y = pin_box_top_left(cx, cy, self.box_w, self.box_h, rect)
         self.move_top_left(x, y)
         return x + (self.box_w // 2), y + (self.box_h // 2)
 
@@ -1284,12 +1309,12 @@ def run(
 
     def get_frame() -> tuple[int, int, int, int]:
         """Center + current capture size (grows/shrinks with zoom, aspect locked)."""
-        cx, cy = follow["center"]
-        return int(cx), int(cy), overlay.box_w, overlay.box_h
+        x, y = overlay.top_left
+        return int(x + overlay.box_w // 2), int(y + overlay.box_h // 2), overlay.box_w, overlay.box_h
 
     def place_overlay() -> None:
         cx, cy = follow["center"]
-        follow["center"] = overlay.follow_center(int(cx), int(cy))
+        overlay.follow_center(int(cx), int(cy))
 
     def set_zoom_level(level: float) -> None:
         level = max(ZOOM_MIN, min(ZOOM_MAX, float(level)))
@@ -1310,7 +1335,8 @@ def run(
         if follow["locked"]:
             return
         cx, cy = get_cursor_pos()
-        follow["center"] = overlay.follow_center(int(cx), int(cy))
+        follow["center"] = (int(cx), int(cy))
+        overlay.follow_center(int(cx), int(cy))
 
     def toggle_follow() -> None:
         follow["locked"] = not follow["locked"]

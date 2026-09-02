@@ -15,11 +15,11 @@ echo     2. Frame rate      (24 / 30 / 60 fps)
 echo     3. Microphone
 echo     4. Frame size      (16:9 / 9:16 / custom)
 echo.
-echo   The cyan box stays on screen until you zoom in.
+echo   The cyan box stays on screen. Zoom toward a corner and those edges stick.
 echo   Pick 16:9, 9:16, or custom to see that size immediately.
 echo   4K files stay 3840x2160 even if the viewfinder is smaller on this screen.
 echo   Press Ctrl+Caps Lock to park the border (stops following).
-echo   Hold Ctrl+Shift and Plus to zoom in smoothly (can leave the screen).
+echo   Hold Ctrl+Shift and Plus to zoom in smoothly. Near a corner, those edges stay on screen.
 echo   Hold Ctrl+Shift and Minus to zoom out. Ratio stays locked.
 echo   Red rec dot sits in the bottom-left corner with the timer below it.
 echo   Hover the dot for Start, Stop, Refresh, and Exit.
