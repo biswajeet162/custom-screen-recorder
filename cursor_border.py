@@ -48,13 +48,15 @@ from recorder import (
     QUALITY_PRESETS,
     ScreenRecorder,
     WebcamCapture,
+    CameraDevice,
     camera_overlay_pixels,
     default_output_path,
+    discover_cameras,
     encoder_preset,
     ensure_recording_deps,
     even,
+    find_camera,
     find_ffmpeg,
-    list_cameras,
     list_microphones,
     preferred_camera,
     preferred_microphone,
@@ -1107,19 +1109,36 @@ def _mic_choices(mics: list[str]) -> list[tuple[str, str]]:
     return choices
 
 
-def _camera_choices(cameras: list[str]) -> list[tuple[str, str]]:
+def _camera_choices(
+    catalog: list[CameraDevice],
+    working: set[str] | None = None,
+) -> list[tuple[str, str]]:
     choices: list[tuple[str, str]] = []
-    default = preferred_camera(cameras)
-    if default:
-        choices.append((f"Auto-detected: {default}", default))
-        for name in cameras:
-            if name != default:
-                choices.append((name, name))
+    names = [dev.name for dev in catalog]
+    default = preferred_camera(names) if names else None
+    for dev in catalog:
+        name = dev.name
+        if dev.backend == "http" and dev.source_url:
+            status = "ready" if working is not None and name in working else "start DroidCam client"
+        elif not dev.driver_ok:
+            status = f"driver {dev.pnp_status.lower()} — fix in Device Manager"
+        elif working is not None:
+            status = "ready" if name in working else "select to connect"
+        else:
+            status = ""
+        label = f"{name}  ({status})" if status else name
+        if name == default:
+            label = f"{label}  — default"
+        choices.append((label, name))
     choices.append(("No webcam overlay", NO_CAMERA))
     return choices
 
 
-def ask_setup_gui(mics: list[str], cameras: list[str], all_cameras: list[str]) -> dict | None:
+def ask_setup_gui(
+    mics: list[str],
+    catalog: list[CameraDevice],
+    working_names: set[str] | None = None,
+) -> dict | None:
     """Quality / microphone / frame-size window. None if the user cancels."""
     result: dict | None = None
     root = tk.Tk()
@@ -1134,7 +1153,7 @@ def ask_setup_gui(mics: list[str], cameras: list[str], all_cameras: list[str]) -
     custom_h = tk.StringVar(value="1080")
     mic_choices = _mic_choices(mics)
     mic_display = tk.StringVar(value=mic_choices[0][0])
-    camera_choices = _camera_choices(cameras)
+    camera_choices = _camera_choices(catalog, working_names)
     camera_display = tk.StringVar(value=camera_choices[0][0])
     camera_shape_var = tk.StringVar(value="circle")
     camera_size_var = tk.StringVar(value="medium")
@@ -1219,12 +1238,12 @@ def ask_setup_gui(mics: list[str], cameras: list[str], all_cameras: list[str]) -
             ov.clear_webcam_overlay()
         if not name:
             return
-        if name not in all_cameras:
+        dev = find_camera(name, catalog)
+        if dev is None:
             messagebox.showerror("Camera", f"Camera not found: {name}")
             return
         try:
-            idx = all_cameras.index(name)
-            cam_state["webcam"] = WebcamCapture.open(idx, name)
+            cam_state["webcam"] = WebcamCapture.open_device(dev, catalog=catalog)
             if not cam_state["use_custom"]:
                 apply_preset_position()
             print(f"  Camera on: {name}")
@@ -1391,10 +1410,17 @@ def ask_setup_gui(mics: list[str], cameras: list[str], all_cameras: list[str]) -
     cam_combo.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=2)
     cam_combo.bind("<<ComboboxSelected>>", lambda _e: sync_setup_webcam())
     q_row += 1
-    if not cameras:
+    if not catalog:
         ttk.Label(
             frm,
-            text="No cameras found — connect a webcam or use your laptop camera.",
+            text="No cameras found — connect a webcam or use DroidCam on your phone.",
+            foreground="#666666",
+        ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
+        q_row += 1
+    else:
+        ttk.Label(
+            frm,
+            text="DroidCam: keep the PC client running with video streaming — we use the same feed.",
             foreground="#666666",
         ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
         q_row += 1
@@ -1630,7 +1656,7 @@ def ask_setup_gui(mics: list[str], cameras: list[str], all_cameras: list[str]) -
     return result
 
 
-def ask_setup_cli(mics: list[str], cameras: list[str]) -> dict | None:
+def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
     print()
     print("  Cursor Follower — Record")
     print("  ------------------------")
@@ -1705,14 +1731,18 @@ def ask_setup_cli(mics: list[str], cameras: list[str]) -> dict | None:
     camera_shape = "circle"
     camera_size = "medium"
     camera_position = "bottom_right"
-    if cameras:
+    if catalog:
+        cameras = [d.name for d in catalog]
         default_cam = preferred_camera(cameras) or cameras[0]
         default_cam_idx = cameras.index(default_cam) + 1
         print(f"    Auto-detected: {default_cam}")
         print()
-        for i, name in enumerate(cameras, start=1):
-            tag = "  [default]" if name == default_cam else ""
-            print(f"    {i}) {name}{tag}")
+        for i, dev in enumerate(catalog, start=1):
+            tag = "  [default]" if dev.name == default_cam else ""
+            status = ""
+            if not dev.driver_ok:
+                status = f"  [{dev.pnp_status} — fix in Device Manager]"
+            print(f"    {i}) {dev.name}{tag}{status}")
         print(f"    {len(cameras) + 1}) No webcam overlay")
         print()
         while True:
@@ -1814,8 +1844,8 @@ def ask_setup_cli(mics: list[str], cameras: list[str]) -> dict | None:
 def resolve_session(
     args: argparse.Namespace,
     mics: list[str],
-    cameras: list[str],
-    all_cameras: list[str],
+    catalog: list[CameraDevice],
+    working_names: set[str] | None = None,
 ) -> dict | None:
     """Build a session dict from CLI flags, or open the setup prompt."""
     overlay_only = bool(args.overlay_only)
@@ -1874,7 +1904,7 @@ def resolve_session(
             "encode_width": encode_w,
             "encode_height": encode_h,
             "mic_name": mic_name,
-            "camera_name": preferred_camera(cameras),
+            "camera_name": preferred_camera([d.name for d in catalog]),
             "camera_shape": "circle",
             "camera_size": "medium",
             "camera_position": "bottom_right",
@@ -1884,8 +1914,8 @@ def resolve_session(
         }
 
     if args.cli:
-        return ask_setup_cli(mics, cameras)
-    return ask_setup_gui(mics, cameras, all_cameras)
+        return ask_setup_cli(mics, catalog)
+    return ask_setup_gui(mics, catalog, working_names=working_names)
 
 
 # -----------------------------------------------------------------------------
@@ -1911,7 +1941,7 @@ def run(
     camera_position: str,
     camera_ox: int | None,
     camera_oy: int | None,
-    all_cameras: list[str],
+    catalog: list[CameraDevice],
     webcam_capture: WebcamCapture | None,
     ffmpeg: str | None,
 ) -> None:
@@ -1949,16 +1979,16 @@ def run(
         webcam.stop()
         webcam = None
 
-    if camera_name and camera_name in all_cameras:
-        if webcam is None:
+    if camera_name:
+        dev = find_camera(camera_name, catalog)
+        if webcam is None and dev is not None:
             try:
-                cam_idx = all_cameras.index(camera_name)
-                webcam = WebcamCapture.open(cam_idx, camera_name)
+                webcam = WebcamCapture.open_device(dev, catalog=catalog)
                 print(f"  Webcam overlay: {camera_name}")
             except Exception as exc:  # noqa: BLE001
                 print(f"  Could not open camera ({exc}). Continuing without webcam overlay.")
                 webcam = None
-        else:
+        elif webcam is not None:
             print(f"  Webcam overlay: {camera_name} (from setup)")
 
     def get_frame() -> tuple[int, int, int, int]:
@@ -2220,8 +2250,8 @@ def main() -> int:
 
     ffmpeg = None
     mics: list[str] = []
-    cameras: list[str] = []
-    working: list[str] = []
+    catalog: list[CameraDevice] = []
+    working_names: set[str] = set()
     if not args.overlay_only:
         try:
             ffmpeg = find_ffmpeg()
@@ -2234,16 +2264,26 @@ def main() -> int:
             print(f"  Could not list microphones ({exc}). Continuing without a default mic.")
             mics = []
         try:
-            cameras = list_cameras(ffmpeg)
+            catalog = discover_cameras(ffmpeg)
         except Exception as exc:  # noqa: BLE001
             print(f"  Could not list cameras ({exc}). Continuing without webcam overlay.")
-            cameras = []
-        working = probe_cameras(ffmpeg) if cameras else []
-        if working:
-            print(f"  Working cameras: {', '.join(working)}")
-        elif cameras:
-            print(f"  Cameras detected (not verified): {', '.join(cameras)}")
-            working = cameras
+            catalog = []
+        cameras = [d.name for d in catalog]
+        working_list = probe_cameras(ffmpeg) if catalog else []
+        working_names = set(working_list)
+        if catalog:
+            print(f"  Cameras found: {', '.join(cameras)}")
+            if working_list:
+                print(f"  Ready now: {', '.join(working_list)}")
+            offline = [c for c in cameras if c not in working_names]
+            if offline:
+                print(f"  Not ready yet: {', '.join(offline)}")
+            for dev in catalog:
+                if not dev.driver_ok and dev.backend != "http":
+                    print(
+                        f"  Warning: {dev.name} driver is {dev.pnp_status} — "
+                        "in Device Manager disable then enable it, or reinstall DroidCam."
+                    )
         else:
             print("  No cameras detected.")
 
@@ -2252,7 +2292,7 @@ def main() -> int:
         else:
             print("  No microphones detected.")
 
-    session = resolve_session(args, mics, working, cameras)
+    session = resolve_session(args, mics, catalog, working_names)
     if session is None:
         print("  Cancelled.")
         return 0
@@ -2275,7 +2315,7 @@ def main() -> int:
             camera_position=str(session.get("camera_position") or "bottom_right"),
             camera_ox=session.get("camera_ox"),
             camera_oy=session.get("camera_oy"),
-            all_cameras=cameras,
+            catalog=catalog,
             webcam_capture=session.get("webcam_capture"),
             ffmpeg=ffmpeg,
         )

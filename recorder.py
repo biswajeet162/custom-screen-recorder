@@ -7,10 +7,12 @@ from __future__ import annotations
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -166,29 +168,8 @@ def list_microphones(ffmpeg: str | None = None) -> list[str]:
     return devices
 
 
-def probe_cameras(ffmpeg: str | None = None) -> list[str]:
-    """Return camera names that open and deliver a frame right now."""
-    import cv2
-
-    names = list_cameras(ffmpeg)
-    working: list[str] = []
-    for idx, name in enumerate(names):
-        for api in (cv2.CAP_DSHOW, cv2.CAP_MSMF):
-            cap = cv2.VideoCapture(idx, api)
-            if not cap.isOpened():
-                cap.release()
-                continue
-            ok, frame = cap.read()
-            cap.release()
-            if ok and frame is not None:
-                working.append(name)
-                break
-        time.sleep(0.12)
-    return working
-
-
-def list_cameras(ffmpeg: str | None = None) -> list[str]:
-    """DirectShow video capture devices (Windows)."""
+def _ffmpeg_dshow_video_devices(ffmpeg: str | None = None) -> list[str]:
+    """DirectShow video devices reported by ffmpeg."""
     exe = ffmpeg or find_ffmpeg()
     proc = subprocess.run(
         [exe, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
@@ -222,6 +203,231 @@ def list_cameras(ffmpeg: str | None = None) -> list[str]:
             if name not in devices:
                 devices.append(name)
     return devices
+
+
+def _pnp_video_devices() -> dict[str, str]:
+    """Windows PnP cameras, including Media Foundation-only devices like DroidCam Video."""
+    if sys.platform != "win32":
+        return {}
+    ps = (
+        "Get-PnpDevice -ErrorAction SilentlyContinue | "
+        "Where-Object { ($_.Class -eq 'Camera') -or "
+        "($_.Class -eq 'MEDIA' -and $_.FriendlyName -match 'DroidCam|Webcam|Video') } | "
+        "Where-Object { $_.FriendlyName -notmatch 'Audio|Microphone|Effect|Studio' } | "
+        "ForEach-Object { $_.FriendlyName + '|' + $_.Status }"
+    )
+    proc = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", ps],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=CREATE_NO_WINDOW,
+    )
+    devices: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        if "|" not in line:
+            continue
+        name, status = line.split("|", 1)
+        name = name.strip()
+        status = status.strip()
+        if name:
+            devices[name] = status
+    return devices
+
+
+def _scan_msmf_indices(max_idx: int = 16) -> list[int]:
+    """OpenCV MSMF indices that currently deliver a frame."""
+    import cv2
+
+    working: list[int] = []
+    for idx in range(max_idx):
+        cap = cv2.VideoCapture(idx, cv2.CAP_MSMF)
+        if not cap.isOpened():
+            cap.release()
+            continue
+        ok, frame = cap.read()
+        cap.release()
+        if ok and frame is not None:
+            working.append(idx)
+        time.sleep(0.05)
+    return working
+
+
+DROIDCAM_HTTP_URLS = (
+    "http://127.0.0.1:4747/video",
+    "http://localhost:4747/video",
+    "http://127.0.0.1:4747/mjpegfeed",
+    "http://localhost:4747/mjpegfeed",
+    "http://127.0.0.1:4747/mjpegfeed?640x480",
+    "http://localhost:4747/mjpegfeed?640x480",
+)
+
+
+def _probe_http_stream(url: str) -> bool:
+    """Return True if an HTTP MJPEG/VideoCapture URL delivers a frame."""
+    import cv2
+
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap.release()
+        return False
+    ok, frame = cap.read()
+    cap.release()
+    return bool(ok and frame is not None)
+
+
+def _droidcam_client_listening() -> bool:
+    """True when the DroidCam PC client is serving video on the default port."""
+    for host in ("127.0.0.1", "localhost"):
+        try:
+            with socket.create_connection((host, 4747), timeout=0.35):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def find_droidcam_http_url() -> str | None:
+    """DroidCam PC client exposes the phone camera on localhost when streaming."""
+    if not _droidcam_client_listening():
+        return None
+    for url in DROIDCAM_HTTP_URLS:
+        if _probe_http_stream(url):
+            return url
+    return None
+
+
+@dataclass
+class CameraDevice:
+    name: str
+    backend: str  # "dshow" | "msmf" | "http"
+    index: int = -1
+    pnp_status: str | None = None
+    source_url: str | None = None
+
+    @property
+    def driver_ok(self) -> bool:
+        if self.backend == "http" and self.source_url:
+            return True
+        if not self.pnp_status:
+            return True
+        return self.pnp_status.lower() in ("ok", "unknown")
+
+    @property
+    def can_try_open(self) -> bool:
+        if self.backend == "http" and self.source_url:
+            return True
+        return self.driver_ok
+
+
+def _assign_msmf_indices(devices: list[CameraDevice]) -> None:
+    msmf = _scan_msmf_indices()
+    if not msmf:
+        return
+    mf_only = [d for d in devices if d.backend == "msmf"]
+    if not mf_only:
+        return
+    pool = list(msmf)
+    has_dshow_integrated = any(
+        d.backend == "dshow"
+        and any(
+            hint in d.name.lower()
+            for hint in ("integrated", "built-in", "facetime", "laptop", "hd user facing")
+        )
+        for d in devices
+    )
+    if has_dshow_integrated and len(pool) > 1 and len(mf_only) <= len(pool) - 1:
+        pool = pool[1:]
+    if len(mf_only) == 1:
+        mf_only[0].index = pool[0] if pool else msmf[0]
+        return
+    for dev, idx in zip(mf_only, pool):
+        dev.index = idx
+
+
+def discover_cameras(ffmpeg: str | None = None) -> list[CameraDevice]:
+    """All video cameras: DirectShow + Media Foundation + DroidCam HTTP stream."""
+    dshow = _ffmpeg_dshow_video_devices(ffmpeg)
+    pnp = _pnp_video_devices()
+    by_key: dict[str, CameraDevice] = {}
+    for idx, name in enumerate(dshow):
+        by_key[name.lower()] = CameraDevice(name, "dshow", idx, pnp.get(name))
+    for name, status in pnp.items():
+        key = name.lower()
+        if key not in by_key:
+            by_key[key] = CameraDevice(name, "msmf", -1, status)
+    devices = list(by_key.values())
+    _assign_msmf_indices(devices)
+
+    droidcam_url = find_droidcam_http_url()
+    if droidcam_url:
+        wired = False
+        for dev in devices:
+            if "droid" in dev.name.lower():
+                dev.backend = "http"
+                dev.source_url = droidcam_url
+                dev.index = -1
+                wired = True
+                break
+        if not wired:
+            devices.append(
+                CameraDevice(
+                    "DroidCam (phone stream)",
+                    "http",
+                    -1,
+                    "OK",
+                    droidcam_url,
+                )
+            )
+    return devices
+
+
+def find_camera(name: str, catalog: list[CameraDevice]) -> CameraDevice | None:
+    key = name.lower()
+    for dev in catalog:
+        if dev.name.lower() == key:
+            return dev
+    return None
+
+
+def _resolve_msmf_index(device: CameraDevice, catalog: list[CameraDevice]) -> int | None:
+    if device.index >= 0:
+        return device.index
+    msmf = _scan_msmf_indices()
+    if not msmf:
+        return None
+    mf_only = [d for d in catalog if d.backend == "msmf"]
+    if len(mf_only) == 1 and len(msmf) == 1:
+        return msmf[0]
+    if "droid" in device.name.lower():
+        for idx in reversed(msmf):
+            if idx > 0:
+                return idx
+        return msmf[-1]
+    return msmf[0]
+
+
+def probe_cameras(ffmpeg: str | None = None) -> list[str]:
+    """Return camera names that open and deliver a frame right now."""
+    working: list[str] = []
+    catalog = discover_cameras(ffmpeg)
+    for dev in catalog:
+        if not dev.can_try_open:
+            continue
+        try:
+            cap = WebcamCapture.open_device(dev, catalog=catalog, retries=2, delay_s=0.25)
+            cap.stop()
+            working.append(dev.name)
+        except Exception:
+            pass
+        time.sleep(0.12)
+    return working
+
+
+def list_cameras(ffmpeg: str | None = None) -> list[str]:
+    """All detected video capture devices (DirectShow + Media Foundation)."""
+    return [dev.name for dev in discover_cameras(ffmpeg)]
 
 
 _LOOPBACK_HINTS = ("stereo mix", "what u hear", "loopback", "wave out")
@@ -349,9 +555,16 @@ def composite_webcam_onto(
 
 
 class WebcamCapture:
-    """Threaded DirectShow webcam reader (one owner per device)."""
+    """Threaded webcam reader (DirectShow, Media Foundation, or HTTP/MJPEG)."""
 
-    def __init__(self, device_index: int, device_name: str | None = None) -> None:
+    def __init__(
+        self,
+        device_index: int = -1,
+        device_name: str | None = None,
+        *,
+        backend: str = "dshow",
+        source_url: str | None = None,
+    ) -> None:
         import cv2
 
         self._lock = threading.Lock()
@@ -359,24 +572,28 @@ class WebcamCapture:
         self._stop = threading.Event()
         self._device_index = int(device_index)
         self._device_name = device_name
-        self._cap = None
-        self._api = cv2.CAP_DSHOW
-        for api in (cv2.CAP_DSHOW, cv2.CAP_MSMF):
+        self._backend = backend
+        self._source_url = source_url
+        if backend == "http" and source_url:
+            cap = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
+        else:
+            api = cv2.CAP_MSMF if backend == "msmf" else cv2.CAP_DSHOW
             cap = cv2.VideoCapture(int(device_index), api)
-            if not cap.isOpened():
-                cap.release()
-                continue
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                self._cap = cap
-                self._api = api
-                with self._lock:
-                    self._frame = frame
-                break
+        self._api = cv2.CAP_FFMPEG if backend == "http" else (
+            cv2.CAP_MSMF if backend == "msmf" else cv2.CAP_DSHOW
+        )
+        if not cap.isOpened():
             cap.release()
-        if self._cap is None:
-            label = device_name or f"index {device_index}"
+            label = device_name or source_url or f"index {device_index}"
             raise RuntimeError(f"Could not open camera {label}")
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            cap.release()
+            label = device_name or source_url or f"index {device_index}"
+            raise RuntimeError(f"Could not read from camera {label}")
+        self._cap = cap
+        with self._lock:
+            self._frame = frame
         try:
             self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
@@ -389,13 +606,14 @@ class WebcamCapture:
         device_index: int,
         device_name: str | None = None,
         *,
+        backend: str = "dshow",
         retries: int = 8,
         delay_s: float = 0.5,
     ) -> "WebcamCapture":
         last_err: Exception | None = None
         for attempt in range(max(1, retries)):
             try:
-                cap = cls(device_index, device_name)
+                cap = cls(device_index, device_name, backend=backend)
                 cap.start()
                 return cap
             except Exception as exc:  # noqa: BLE001
@@ -403,6 +621,67 @@ class WebcamCapture:
                 if attempt + 1 < retries:
                     time.sleep(delay_s)
         raise RuntimeError(str(last_err or "Could not open camera"))
+
+    @classmethod
+    def open_url(
+        cls,
+        source_url: str,
+        device_name: str | None = None,
+        *,
+        retries: int = 8,
+        delay_s: float = 0.5,
+    ) -> "WebcamCapture":
+        last_err: Exception | None = None
+        for attempt in range(max(1, retries)):
+            try:
+                cap = cls(-1, device_name, backend="http", source_url=source_url)
+                cap.start()
+                return cap
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                if attempt + 1 < retries:
+                    time.sleep(delay_s)
+        raise RuntimeError(str(last_err or "Could not open camera stream"))
+
+    @classmethod
+    def open_device(
+        cls,
+        device: CameraDevice,
+        *,
+        catalog: list[CameraDevice] | None = None,
+        retries: int = 8,
+        delay_s: float = 0.5,
+    ) -> "WebcamCapture":
+        if device.backend == "http" and device.source_url:
+            return cls.open_url(
+                device.source_url,
+                device.name,
+                retries=retries,
+                delay_s=delay_s,
+            )
+        if "droid" in device.name.lower():
+            url = find_droidcam_http_url()
+            if url:
+                return cls.open_url(url, device.name, retries=retries, delay_s=delay_s)
+        backend = device.backend
+        index = device.index
+        if backend == "msmf" and index < 0:
+            index = _resolve_msmf_index(device, catalog or [device]) or -1
+        if index < 0:
+            label = device.name
+            msg = f"Could not open camera {label}"
+            if "droid" in device.name.lower():
+                msg += (
+                    ". Start the DroidCam client on your PC, press Start so video is "
+                    "streaming, then select this camera again."
+                )
+            elif device.pnp_status and device.pnp_status.lower() == "error":
+                msg += (
+                    ". The camera driver has an error in Device Manager — "
+                    "disable then enable the device, or reinstall its software."
+                )
+            raise RuntimeError(msg)
+        return cls.open(index, device.name, backend=backend, retries=retries, delay_s=delay_s)
 
     def start(self) -> None:
         if self._thread is not None:
