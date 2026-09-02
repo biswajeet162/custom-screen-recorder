@@ -1,8 +1,8 @@
 """
 Cursor-centered aspect-ratio border overlay for Windows.
 
-Shows a fullscreen setup window (quality, microphone, frame size, camera options)
-then records the screen inside that rectangle with the chosen microphone.
+Shows a fullscreen two-column setup window (capture settings and camera options)
+then records the screen inside the chosen frame with the chosen microphone.
 Press Ctrl+Caps Lock to park the border.
 Press Ctrl+Caps Lock again to follow the pointer.
 Hold Ctrl+Shift and Right to zoom the border in, or Left to zoom out.
@@ -238,18 +238,24 @@ def configure_setup_theme(root: tk.Tk) -> ttk.Style:
         pass
     style.configure(".", background=SETUP_PANEL, foreground=SETUP_TEXT)
     style.configure("Setup.TFrame", background=SETUP_PANEL)
-    style.configure("Setup.TLabel", background=SETUP_PANEL, foreground=SETUP_TEXT)
+    style.configure("Setup.TLabel", background=SETUP_PANEL, foreground=SETUP_TEXT, font=("Segoe UI", 14))
     style.configure(
         "SetupMuted.TLabel",
         background=SETUP_PANEL,
         foreground=SETUP_MUTED,
-        font=("Segoe UI", 9),
+        font=("Segoe UI", 12),
     )
     style.configure(
         "SetupTitle.TLabel",
         background=SETUP_PANEL,
         foreground=SETUP_TEXT,
-        font=("Segoe UI", 11, "bold"),
+        font=("Segoe UI", 18, "bold"),
+    )
+    style.configure(
+        "SetupColTitle.TLabel",
+        background=SETUP_PANEL,
+        foreground=SETUP_ACCENT,
+        font=("Segoe UI", 20, "bold"),
     )
     style.configure(
         "TCombobox",
@@ -258,6 +264,7 @@ def configure_setup_theme(root: tk.Tk) -> ttk.Style:
         foreground=SETUP_TEXT,
         arrowcolor=SETUP_TEXT,
         bordercolor=SETUP_BORDER,
+        font=("Segoe UI", 13),
     )
     style.map("TCombobox", fieldbackground=[("readonly", SETUP_CARD)])
     style.configure(
@@ -266,6 +273,7 @@ def configure_setup_theme(root: tk.Tk) -> ttk.Style:
         foreground=SETUP_TEXT,
         insertcolor=SETUP_TEXT,
         bordercolor=SETUP_BORDER,
+        font=("Segoe UI", 13),
     )
     style.configure(
         "Horizontal.TScale",
@@ -299,6 +307,28 @@ def setup_fullscreen_root(root: tk.Tk) -> None:
     root.minsize(960, 640)
     try:
         root.state("zoomed")
+    except tk.TclError:
+        pass
+
+
+def lift_preview_above_settings(root: tk.Tk, preview: CyanBorder) -> None:
+    """Keep the cyan capture frame above the fullscreen settings panel."""
+    try:
+        preview.win.attributes("-topmost", True)
+        preview.win.lift()
+        root.attributes("-topmost", False)
+        root.lift()
+        preview.win.lift()
+        if preview.hwnd:
+            user32.SetWindowPos(
+                preview.hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOMOVE,
+            )
     except tk.TclError:
         pass
 
@@ -1541,7 +1571,7 @@ def ask_setup_gui(
 
     position_items = _position_combo_items()
     position_by_label = {lbl: key for lbl, key in position_items}
-    position_display = tk.StringVar(value=position_items[3][0])
+    position_display = tk.StringVar(value=position_items[2][0])
 
     zoom_items = _zoom_combo_items()
     zoom_by_label = {lbl: val for lbl, val in zoom_items}
@@ -1558,6 +1588,27 @@ def ask_setup_gui(
 
     def close_setup() -> None:
         root.destroy()
+
+    def selected_camera_name() -> str | None:
+        name = camera_by_label.get(camera_display.get(), NO_CAMERA)
+        if name == NO_CAMERA:
+            return None
+        return name
+
+    def camera_shape_key() -> str:
+        return shape_by_label.get(shape_display.get(), "square")
+
+    def camera_size_key() -> str:
+        return size_by_label.get(size_display.get(), "medium")
+
+    def camera_position_key() -> str:
+        return position_by_label.get(position_display.get(), "bottom_left")
+
+    def camera_zoom_value() -> float:
+        return zoom_by_label.get(zoom_display.get(), 1.0)
+
+    def camera_rotation_value() -> int:
+        return rotation_by_label.get(rotation_display.get(), 0)
 
     def quality_key() -> str:
         return quality_by_label.get(quality_display.get(), "hd")
@@ -1640,14 +1691,12 @@ def ask_setup_gui(
             size_note.set("Frame must be at least 64 × 64 pixels.")
             return
         enc_w, enc_h = current_encode_size()
-        cam_name = camera_by_label.get(camera_display.get(), NO_CAMERA)
-        if cam_name == NO_CAMERA:
-            cam_name = None
+        cam_name = selected_camera_name()
         _, _, ox, oy = camera_overlay_pixels(
             enc_w,
             enc_h,
-            size_by_label.get(size_display.get(), "medium"),
-            position_by_label.get(position_display.get(), "bottom_right"),
+            camera_size_key(),
+            camera_position_key(),
         )
         shortcuts = {
             key: shortcut_vars[key].get().strip() for key in DEFAULT_SHORTCUTS
@@ -1662,17 +1711,13 @@ def ask_setup_gui(
             "encode_height": enc_h,
             "mic_name": mic_by_label.get(mic_display.get(), mic_choices[0][1]),
             "camera_name": cam_name,
-            "camera_shape": shape_by_label.get(shape_display.get(), "square"),
-            "camera_size": size_by_label.get(size_display.get(), "medium"),
-            "camera_position": position_by_label.get(
-                position_display.get(), "bottom_right"
-            ),
+            "camera_shape": camera_shape_key(),
+            "camera_size": camera_size_key(),
+            "camera_position": camera_position_key(),
             "camera_ox": ox,
             "camera_oy": oy,
-            "camera_zoom": zoom_by_label.get(zoom_display.get(), 1.0),
-            "camera_rotation": rotation_by_label.get(
-                rotation_display.get(), 0
-            ),
+            "camera_zoom": camera_zoom_value(),
+            "camera_rotation": camera_rotation_value(),
             "shortcuts": shortcuts,
             "webcam_capture": None,
             "record": True,
@@ -1682,160 +1727,178 @@ def ask_setup_gui(
     outer = tk.Frame(root, bg=SETUP_BG)
     outer.pack(fill="both", expand=True)
 
-    center = tk.Frame(outer, bg=SETUP_BG)
-    center.place(relx=0.5, rely=0.48, anchor="center")
-
-    card = tk.Frame(center, bg=SETUP_PANEL, padx=44, pady=36)
-    card.pack()
-
+    header = tk.Frame(outer, bg=SETUP_BG, padx=48, pady=36)
+    header.pack(fill="x")
     tk.Label(
-        card,
+        header,
         text="Cursor Follower",
-        font=("Segoe UI", 26, "bold"),
+        font=("Segoe UI", 34, "bold"),
         fg=SETUP_ACCENT,
-        bg=SETUP_PANEL,
+        bg=SETUP_BG,
     ).pack(anchor="w")
     tk.Label(
-        card,
-        text="Recording setup",
-        font=("Segoe UI", 12),
+        header,
+        text="Recording setup — choose capture and camera options below",
+        font=("Segoe UI", 15),
         fg=SETUP_MUTED,
-        bg=SETUP_PANEL,
-    ).pack(anchor="w", pady=(4, 20))
+        bg=SETUP_BG,
+    ).pack(anchor="w", pady=(8, 0))
 
-    form = tk.Frame(card, bg=SETUP_PANEL)
-    form.pack(fill="x")
-    form.columnconfigure(1, weight=1)
+    columns = tk.Frame(outer, bg=SETUP_BG)
+    columns.pack(fill="both", expand=True, padx=40, pady=(0, 12))
 
-    def add_row(row: int, label: str, widget: tk.Widget) -> None:
+    col_left = tk.Frame(columns, bg=SETUP_PANEL, padx=40, pady=32)
+    col_left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+
+    col_right = tk.Frame(columns, bg=SETUP_PANEL, padx=40, pady=32)
+    col_right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+    ttk.Label(col_left, text="Capture settings", style="SetupColTitle.TLabel").pack(
+        anchor="w", pady=(0, 24)
+    )
+    ttk.Label(col_right, text="Camera overlay", style="SetupColTitle.TLabel").pack(
+        anchor="w", pady=(0, 24)
+    )
+
+    form_left = tk.Frame(col_left, bg=SETUP_PANEL)
+    form_left.pack(fill="x")
+    form_left.columnconfigure(1, weight=1)
+
+    form_right = tk.Frame(col_right, bg=SETUP_PANEL)
+    form_right.pack(fill="x")
+    form_right.columnconfigure(1, weight=1)
+
+    def add_row(
+        form: tk.Frame, row: int, label: str, widget: tk.Widget, pady: int = 12
+    ) -> None:
         ttk.Label(form, text=label, style="Setup.TLabel").grid(
-            row=row, column=0, sticky="w", pady=9, padx=(0, 18)
+            row=row, column=0, sticky="w", pady=pady, padx=(0, 20)
         )
-        widget.grid(row=row, column=1, sticky="ew", pady=9)
+        widget.grid(row=row, column=1, sticky="ew", pady=pady)
 
-    combo_width = 46
+    combo_width = 42
 
     quality_combo = ttk.Combobox(
-        form,
+        form_left,
         textvariable=quality_display,
         values=[lbl for lbl, _ in quality_items],
         state="readonly",
         width=combo_width,
     )
-    add_row(0, "Video quality", quality_combo)
+    add_row(form_left, 0, "Video quality", quality_combo)
 
     fps_combo = ttk.Combobox(
-        form,
+        form_left,
         textvariable=fps_display,
         values=[lbl for lbl, _ in fps_items],
         state="readonly",
         width=combo_width,
     )
-    add_row(1, "Frame rate", fps_combo)
+    add_row(form_left, 1, "Frame rate", fps_combo)
 
     mic_combo = ttk.Combobox(
-        form,
+        form_left,
         textvariable=mic_display,
         values=[lbl for lbl, _ in mic_choices],
         state="readonly",
         width=combo_width,
     )
-    add_row(2, "Microphone", mic_combo)
+    add_row(form_left, 2, "Microphone", mic_combo)
 
     camera_combo = ttk.Combobox(
-        form,
+        form_left,
         textvariable=camera_display,
         values=[lbl for lbl, _ in camera_choices],
         state="readonly",
         width=combo_width,
     )
-    add_row(3, "Web camera", camera_combo)
+    add_row(form_left, 3, "Web camera", camera_combo)
 
     ratio_combo = ttk.Combobox(
-        form,
+        form_left,
         textvariable=ratio_display,
         state="readonly",
         width=combo_width,
     )
-    add_row(4, "Frame size", ratio_combo)
+    add_row(form_left, 4, "Frame size", ratio_combo)
 
-    custom_row = tk.Frame(form, bg=SETUP_PANEL)
-    custom_row.grid(row=5, column=1, sticky="w", pady=(0, 4))
+    custom_row = tk.Frame(form_left, bg=SETUP_PANEL)
+    custom_row.grid(row=5, column=1, sticky="w", pady=(0, 8))
     ttk.Label(custom_row, text="Width", style="Setup.TLabel").pack(side="left")
-    entry_w = ttk.Entry(custom_row, textvariable=custom_w, width=8)
-    entry_w.pack(side="left", padx=(6, 16))
+    entry_w = ttk.Entry(custom_row, textvariable=custom_w, width=10)
+    entry_w.pack(side="left", padx=(8, 20))
     ttk.Label(custom_row, text="Height", style="Setup.TLabel").pack(side="left")
-    entry_h = ttk.Entry(custom_row, textvariable=custom_h, width=8)
-    entry_h.pack(side="left", padx=(6, 0))
+    entry_h = ttk.Entry(custom_row, textvariable=custom_h, width=10)
+    entry_h.pack(side="left", padx=(8, 0))
+
+    tk.Label(
+        form_left,
+        textvariable=size_note,
+        font=("Segoe UI", 12),
+        fg=SETUP_MUTED,
+        bg=SETUP_PANEL,
+        wraplength=480,
+        justify="left",
+    ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(16, 0))
 
     shape_combo = ttk.Combobox(
-        form,
+        form_right,
         textvariable=shape_display,
         values=[lbl for lbl, _ in shape_items],
         state="readonly",
         width=combo_width,
     )
-    add_row(6, "Camera shape", shape_combo)
+    add_row(form_right, 0, "Camera shape", shape_combo)
 
     size_combo = ttk.Combobox(
-        form,
+        form_right,
         textvariable=size_display,
         values=[lbl for lbl, _ in size_items],
         state="readonly",
         width=combo_width,
     )
-    add_row(7, "Camera size", size_combo)
+    add_row(form_right, 1, "Camera size", size_combo)
 
     position_combo = ttk.Combobox(
-        form,
+        form_right,
         textvariable=position_display,
         values=[lbl for lbl, _ in position_items],
         state="readonly",
         width=combo_width,
     )
-    add_row(8, "Camera position", position_combo)
+    add_row(form_right, 2, "Camera position", position_combo)
 
     zoom_combo = ttk.Combobox(
-        form,
+        form_right,
         textvariable=zoom_display,
         values=[lbl for lbl, _ in zoom_items],
         state="readonly",
         width=combo_width,
     )
-    add_row(9, "Camera zoom", zoom_combo)
+    add_row(form_right, 3, "Camera zoom", zoom_combo)
 
     rotation_combo = ttk.Combobox(
-        form,
+        form_right,
         textvariable=rotation_display,
         values=[lbl for lbl, _ in rotation_items],
         state="readonly",
         width=combo_width,
     )
-    add_row(10, "Camera rotation", rotation_combo)
+    add_row(form_right, 4, "Camera rotation", rotation_combo)
 
-    tk.Label(
-        form,
-        textvariable=size_note,
-        font=("Segoe UI", 9),
-        fg=SETUP_MUTED,
-        bg=SETUP_PANEL,
-        wraplength=520,
-        justify="left",
-    ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(8, 0))
-
-    footer = tk.Frame(card, bg=SETUP_PANEL)
-    footer.pack(fill="x", pady=(28, 0))
+    footer = tk.Frame(outer, bg=SETUP_BG, padx=48, pady=24)
+    footer.pack(fill="x", side="bottom")
 
     tk.Button(
         footer,
         text="Settings",
-        font=("Segoe UI", 10),
+        font=("Segoe UI", 13),
         fg=SETUP_TEXT,
         bg=SETUP_CARD,
         activebackground=SETUP_BORDER,
         relief="flat",
-        padx=16,
-        pady=8,
+        padx=22,
+        pady=12,
         cursor="hand2",
         command=lambda: open_shortcuts_settings(root, shortcut_vars),
     ).pack(side="left")
@@ -1843,28 +1906,28 @@ def ask_setup_gui(
     tk.Button(
         footer,
         text="Cancel",
-        font=("Segoe UI", 10),
+        font=("Segoe UI", 13),
         fg=SETUP_TEXT,
         bg=SETUP_CARD,
         activebackground=SETUP_BORDER,
         relief="flat",
-        padx=16,
-        pady=8,
+        padx=22,
+        pady=12,
         cursor="hand2",
         command=close_setup,
-    ).pack(side="right", padx=(8, 0))
+    ).pack(side="right", padx=(12, 0))
 
     tk.Button(
         footer,
         text="Start recording",
-        font=("Segoe UI", 11, "bold"),
+        font=("Segoe UI", 14, "bold"),
         fg=SETUP_BG,
         bg=SETUP_ACCENT,
         activebackground=SETUP_ACCENT_HOVER,
         activeforeground=SETUP_BG,
         relief="flat",
-        padx=22,
-        pady=10,
+        padx=28,
+        pady=14,
         cursor="hand2",
         command=start,
     ).pack(side="right")
