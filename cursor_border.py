@@ -5,7 +5,7 @@ Shows a setup prompt (quality, microphone, frame size) with a live cyan
 preview of the chosen size, then records the screen inside that rectangle
 with the chosen microphone. Press Ctrl+Caps Lock to park the border.
 Press Ctrl+Caps Lock again to follow the pointer.
-Hold Ctrl+Shift and + to zoom in, or - to zoom out (smooth, same ratio).
+Hold Ctrl+Shift and Right to zoom in, or Left to zoom out (smooth, same ratio).
 Press Esc to stop and save.
 """
 
@@ -62,10 +62,8 @@ VK_ESCAPE = 0x1B
 VK_CONTROL = 0x11
 VK_SHIFT = 0x10
 VK_CAPITAL = 0x14
-VK_OEM_PLUS = 0xBB
-VK_OEM_MINUS = 0xBD
-VK_ADD = 0x6B
-VK_SUBTRACT = 0x6D
+VK_LEFT = 0x25
+VK_RIGHT = 0x27
 MONITOR_DEFAULTTONEAREST = 2
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -102,7 +100,7 @@ BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl+Caps Lock)
 KEY_COLOR = "#010101"
 KEY_COLORREF = 0x00010101  # 0x00bbggrr for RGB(1,1,1)
 UPDATE_MS = 8  # ~120 FPS — keeps cursor locked to box center
-ZOOM_RATE = 1.55  # size multiplier per second while + / - is held (smooth)
+ZOOM_RATE = 1.55  # size multiplier per second while arrow keys are held (smooth)
 ZOOM_MIN = 0.25
 ZOOM_MAX = 8.0
 
@@ -1460,14 +1458,8 @@ def run(
         ctrl_down = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
         shift_down = bool(user32.GetAsyncKeyState(VK_SHIFT) & 0x8000)
         caps_down = bool(user32.GetAsyncKeyState(VK_CAPITAL) & 0x8000)
-        plus_down = bool(
-            (user32.GetAsyncKeyState(VK_OEM_PLUS) & 0x8000)
-            or (user32.GetAsyncKeyState(VK_ADD) & 0x8000)
-        )
-        minus_down = bool(
-            (user32.GetAsyncKeyState(VK_OEM_MINUS) & 0x8000)
-            or (user32.GetAsyncKeyState(VK_SUBTRACT) & 0x8000)
-        )
+        right_down = bool(user32.GetAsyncKeyState(VK_RIGHT) & 0x8000)
+        left_down = bool(user32.GetAsyncKeyState(VK_LEFT) & 0x8000)
         combo = ctrl_down and caps_down
         if combo and not follow["park_down"]:
             toggle_follow()
@@ -1477,9 +1469,9 @@ def run(
         dt = max(0.0, min(0.05, now - zoom["clock"]))
         zoom["clock"] = now
         zoom_mods = ctrl_down and shift_down and not caps_down
-        if zoom_mods and plus_down and not minus_down:
+        if zoom_mods and right_down and not left_down:
             set_zoom_level(zoom["level"] * (ZOOM_RATE ** dt))
-        elif zoom_mods and minus_down and not plus_down:
+        elif zoom_mods and left_down and not right_down:
             set_zoom_level(zoom["level"] * ((1.0 / ZOOM_RATE) ** dt))
 
         move_to_cursor()
@@ -1514,13 +1506,13 @@ def run(
         print("  Red rec dot is in the bottom-left corner. Timer always; hover for Start / Stop / Refresh / Exit.")
         print("  Start waits 3-2-1. Stop is immediate. Exit saves and quits.")
         print("  Press Ctrl+Caps Lock to park. Press it again to follow.")
-        print("  Hold Ctrl+Shift and + to zoom in, - to zoom out (smooth, ratio locked).")
+        print("  Hold Ctrl+Shift and Right arrow to zoom in, Left arrow to zoom out (smooth, ratio locked).")
         print("  Press Esc to quit.")
         hud = RecordHud(root, hud_start, hud_stop, hud_refresh, finish)
         hud.countdown(lambda: begin_take())
     else:
         print(f"  Overlay only: {ratio}   {box_w}x{box_h}")
-        print("  Press Ctrl+Caps Lock to park. Ctrl+Shift and + / - to zoom.")
+        print("  Press Ctrl+Caps Lock to park. Ctrl+Shift and Left / Right arrow to zoom.")
         print("  Press Esc to quit.")
 
     root.protocol("WM_DELETE_WINDOW", finish)
