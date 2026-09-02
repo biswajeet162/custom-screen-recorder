@@ -1516,20 +1516,40 @@ def ask_setup_gui(
         update_preview()
 
     pad = {"padx": 16, "pady": 4}
-    frm = ttk.Frame(root, padding=12)
+    title_font = ("Segoe UI", 17, "bold")
+    section_font = ("Segoe UI", 12, "bold")
+    body_font = ("Segoe UI", 11)
+    hint_font = ("Segoe UI", 10)
+
+    style = ttk.Style(root)
+    style.configure(".", font=body_font)
+    style.configure("TLabel", font=body_font)
+    style.configure("TRadiobutton", font=body_font)
+    style.configure("TButton", font=body_font)
+    style.configure("TEntry", font=body_font)
+    style.configure("TCombobox", font=body_font)
+
+    frm = ttk.Frame(root, padding=16)
     frm.pack(fill="both", expand=True)
+    frm.columnconfigure(0, weight=1)
+    frm.columnconfigure(1, weight=1)
 
-    ttk.Label(frm, text="Start recording", font=("Segoe UI", 14, "bold")).grid(
-        row=0, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 8)
+    ttk.Label(frm, text="Start recording", font=title_font).grid(
+        row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 10)
     )
 
-    ttk.Label(frm, text="1. Video quality", font=("Segoe UI", 10, "bold")).grid(
-        row=1, column=0, columnspan=3, sticky="w", **pad
+    left = ttk.Frame(frm)
+    left.grid(row=1, column=0, sticky="n", padx=(4, 24))
+    right = ttk.Frame(frm)
+    right.grid(row=1, column=1, sticky="n", padx=(24, 4))
+
+    ttk.Label(left, text="1. Video quality", font=section_font).grid(
+        row=0, column=0, columnspan=3, sticky="w", **pad
     )
-    q_row = 2
+    q_row = 1
     for key, preset in QUALITY_PRESETS.items():
         ttk.Radiobutton(
-            frm,
+            left,
             text=f"{preset['label']}   —  {preset['detail']}",
             variable=quality_var,
             value=key,
@@ -1537,11 +1557,11 @@ def ask_setup_gui(
         ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
         q_row += 1
 
-    ttk.Label(frm, text="2. Frame rate", font=("Segoe UI", 10, "bold")).grid(
+    ttk.Label(left, text="2. Frame rate", font=section_font).grid(
         row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
     )
     q_row += 1
-    fps_row = ttk.Frame(frm)
+    fps_row = ttk.Frame(left)
     fps_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
     for fps_val in FPS_CHOICES:
         extra = "  (recommended)" if fps_val == 30 else ""
@@ -1554,58 +1574,62 @@ def ask_setup_gui(
         ).pack(side="left", padx=(0, 16))
     q_row += 1
 
-    ttk.Label(frm, text="3. Microphone", font=("Segoe UI", 10, "bold")).grid(
+    ttk.Label(left, text="3. Microphone", font=section_font).grid(
         row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
     )
     q_row += 1
     mic_combo = ttk.Combobox(
-        frm,
+        left,
         textvariable=mic_display,
         values=[c[0] for c in mic_choices],
         state="readonly",
-        width=52,
+        width=42,
     )
     mic_combo.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=2)
     q_row += 1
     if not mics:
         ttk.Label(
-            frm,
+            left,
             text="No microphones found — recording will be screen-only unless you plug one in.",
             foreground="#666666",
+            font=hint_font,
         ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
         q_row += 1
 
-    ttk.Label(frm, text="4. Webcam overlay", font=("Segoe UI", 10, "bold")).grid(
-        row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
+    r_row = 0
+    ttk.Label(right, text="4. Webcam overlay", font=section_font).grid(
+        row=r_row, column=0, columnspan=3, sticky="w", pady=(0, 4), padx=16
     )
-    q_row += 1
+    r_row += 1
     cam_combo = ttk.Combobox(
-        frm,
+        right,
         textvariable=camera_display,
         values=[c[0] for c in camera_choices],
         state="readonly",
-        width=52,
+        width=42,
     )
-    cam_combo.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=2)
+    cam_combo.grid(row=r_row, column=0, columnspan=3, sticky="ew", padx=28, pady=2)
     cam_combo.bind("<<ComboboxSelected>>", lambda _e: sync_setup_webcam())
-    q_row += 1
+    r_row += 1
     if not catalog:
         ttk.Label(
-            frm,
+            right,
             text="No cameras found — connect a webcam or use DroidCam on your phone.",
             foreground="#666666",
-        ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-        q_row += 1
+            font=hint_font,
+        ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
+        r_row += 1
     else:
         ttk.Label(
-            frm,
+            right,
             text="DroidCam: keep the PC client running with video streaming — we use the same feed.",
             foreground="#666666",
-        ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-        q_row += 1
+            font=hint_font,
+        ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
+        r_row += 1
 
-    shape_row = ttk.Frame(frm)
-    shape_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    shape_row = ttk.Frame(right)
+    shape_row.grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
     ttk.Label(shape_row, text="Shape:").pack(side="left", padx=(0, 8))
     for shape in CAMERA_SHAPES:
         label = "Circle" if shape == "circle" else "Square"
@@ -1616,10 +1640,10 @@ def ask_setup_gui(
             value=shape,
             command=lambda: on_camera_option_change(False),
         ).pack(side="left", padx=(0, 12))
-    q_row += 1
+    r_row += 1
 
-    size_row = ttk.Frame(frm)
-    size_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    size_row = ttk.Frame(right)
+    size_row.grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
     ttk.Label(size_row, text="Size:").pack(side="left", padx=(0, 8))
     for key in CAMERA_SIZES:
         ttk.Radiobutton(
@@ -1629,10 +1653,10 @@ def ask_setup_gui(
             value=key,
             command=lambda: on_camera_option_change(False),
         ).pack(side="left", padx=(0, 10))
-    q_row += 1
+    r_row += 1
 
-    pos_row = ttk.Frame(frm)
-    pos_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    pos_row = ttk.Frame(right)
+    pos_row.grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
     ttk.Label(pos_row, text="Position:").pack(side="left", padx=(0, 8))
     for key in CAMERA_POSITIONS:
         ttk.Radiobutton(
@@ -1642,10 +1666,10 @@ def ask_setup_gui(
             value=key,
             command=lambda: on_camera_option_change(True),
         ).pack(side="left", padx=(0, 8))
-    q_row += 1
+    r_row += 1
 
-    zoom_row = ttk.Frame(frm)
-    zoom_row.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=(4, 2))
+    zoom_row = ttk.Frame(right)
+    zoom_row.grid(row=r_row, column=0, columnspan=3, sticky="ew", padx=28, pady=(4, 2))
     ttk.Label(zoom_row, text="Camera zoom:").pack(side="left", padx=(0, 8))
     zoom_scale = ttk.Scale(
         zoom_row,
@@ -1663,10 +1687,10 @@ def ask_setup_gui(
         zoom_label.config(text=f"{camera_zoom_var.get():.1f}×")
 
     camera_zoom_var.trace_add("write", refresh_zoom_label)
-    q_row += 1
+    r_row += 1
 
-    rot_row = ttk.Frame(frm)
-    rot_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=(4, 2))
+    rot_row = ttk.Frame(right)
+    rot_row.grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28, pady=(4, 2))
     ttk.Label(rot_row, text="Rotate:").pack(side="left", padx=(0, 8))
     rot_label = ttk.Label(rot_row, text="0°")
     rot_label.pack(side="right", padx=(8, 0))
@@ -1688,64 +1712,47 @@ def ask_setup_gui(
         ("↑ Up", lambda: set_rotation_deg(180)),
         ("↓ Down", lambda: set_rotation_deg(0)),
     ):
-        ttk.Button(rot_row, text=text, width=8, command=cmd).pack(side="left", padx=(0, 6))
+        ttk.Button(rot_row, text=text, width=9, command=cmd).pack(side="left", padx=(0, 6))
     camera_rotation_var.trace_add("write", refresh_rotation_label)
-    q_row += 1
+    r_row += 1
     ttk.Label(
-        frm,
+        right,
         text="Left/Right turn 90°. Up = upside down (180°). Down = normal (0°).",
         foreground="#666666",
-    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-    q_row += 1
+        font=hint_font,
+    ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
+    r_row += 1
     ttk.Label(
-        frm,
+        right,
         text="Zoom crops from the center — use Square shape for the full phone frame.",
         foreground="#666666",
-    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-    q_row += 1
+        font=hint_font,
+    ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
+    r_row += 1
     ttk.Label(
-        frm,
+        right,
         text="Drag the webcam inside the cyan box to reposition it.",
         foreground="#666666",
-    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-    q_row += 1
+        font=hint_font,
+    ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
+    r_row += 1
 
-    ttk.Label(frm, text="5. Keyboard shortcuts", font=("Segoe UI", 10, "bold")).grid(
-        row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
-    )
-    q_row += 1
-    shortcut_vars: dict[str, tk.StringVar] = {
-        key: tk.StringVar(value=DEFAULT_SHORTCUTS[key]) for key in DEFAULT_SHORTCUTS
-    }
-    for key in DEFAULT_SHORTCUTS:
-        row = ttk.Frame(frm)
-        row.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=1)
-        ttk.Label(row, text=SHORTCUT_LABELS[key], width=28).pack(side="left")
-        ttk.Entry(row, textvariable=shortcut_vars[key], width=22).pack(side="left", padx=(8, 0))
-        q_row += 1
-    ttk.Label(
-        frm,
-        text="Examples: Ctrl+Caps, Ctrl+Shift+Right, Ctrl+Numpad7, Ctrl+0",
-        foreground="#666666",
-    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
-    q_row += 1
-
-    ttk.Label(frm, text="6. Frame size (the following border)", font=("Segoe UI", 10, "bold")).grid(
+    ttk.Label(left, text="6. Frame size (the following border)", font=section_font).grid(
         row=q_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
     )
     q_row += 1
     radio_169 = ttk.Radiobutton(
-        frm, variable=ratio_var, value="16:9", command=refresh_size_labels
+        left, variable=ratio_var, value="16:9", command=refresh_size_labels
     )
     radio_169.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
     q_row += 1
     radio_916 = ttk.Radiobutton(
-        frm, variable=ratio_var, value="9:16", command=refresh_size_labels
+        left, variable=ratio_var, value="9:16", command=refresh_size_labels
     )
     radio_916.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
     q_row += 1
 
-    custom_row = ttk.Frame(frm)
+    custom_row = ttk.Frame(left)
     custom_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
     ttk.Radiobutton(
         custom_row,
@@ -1754,24 +1761,46 @@ def ask_setup_gui(
         value="custom",
         command=refresh_size_labels,
     ).pack(side="left")
-    entry_w = ttk.Entry(custom_row, textvariable=custom_w, width=7)
+    entry_w = ttk.Entry(custom_row, textvariable=custom_w, width=8)
     entry_w.pack(side="left", padx=(10, 4))
     ttk.Label(custom_row, text="×").pack(side="left")
-    entry_h = ttk.Entry(custom_row, textvariable=custom_h, width=7)
+    entry_h = ttk.Entry(custom_row, textvariable=custom_h, width=8)
     entry_h.pack(side="left", padx=4)
     ttk.Label(custom_row, text="pixels").pack(side="left")
     q_row += 1
 
-    ttk.Label(frm, textvariable=size_note, foreground="#444444").grid(
+    ttk.Label(left, textvariable=size_note, foreground="#444444").grid(
         row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 2)
     )
     q_row += 1
     ttk.Label(
-        frm,
+        left,
         text="Red rec dot sits in the bottom-left corner. Hover for Start / Stop / Refresh / Exit. 3-2-1 before Start only; Stop is instant.",
         foreground="#444444",
+        wraplength=340,
     ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4))
     q_row += 1
+
+    ttk.Label(right, text="5. Keyboard shortcuts", font=section_font).grid(
+        row=r_row, column=0, columnspan=3, sticky="w", pady=(12, 4), padx=16
+    )
+    r_row += 1
+    shortcut_vars: dict[str, tk.StringVar] = {
+        key: tk.StringVar(value=DEFAULT_SHORTCUTS[key]) for key in DEFAULT_SHORTCUTS
+    }
+    for key in DEFAULT_SHORTCUTS:
+        row = ttk.Frame(right)
+        row.grid(row=r_row, column=0, columnspan=3, sticky="ew", padx=28, pady=1)
+        ttk.Label(row, text=SHORTCUT_LABELS[key], width=24).pack(side="left")
+        ttk.Entry(row, textvariable=shortcut_vars[key], width=20).pack(side="left", padx=(8, 0))
+        r_row += 1
+    ttk.Label(
+        right,
+        text="Examples: Ctrl+Caps, Ctrl+Shift+Right, Ctrl+Numpad7, Ctrl+0",
+        foreground="#666666",
+        font=hint_font,
+    ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
+    r_row += 1
 
     def start() -> None:
         nonlocal result
@@ -1838,7 +1867,7 @@ def ask_setup_gui(
         root.destroy()
 
     btns = ttk.Frame(frm)
-    btns.grid(row=q_row, column=0, columnspan=3, sticky="e", pady=(12, 4), padx=8)
+    btns.grid(row=2, column=0, columnspan=2, sticky="e", pady=(12, 4), padx=8)
     ttk.Button(btns, text="Cancel", command=lambda: (stop_setup_webcam(), root.destroy())).pack(
         side="right", padx=4
     )
@@ -1915,7 +1944,10 @@ def ask_setup_gui(
     preview.center_on_screen()
     root.after(300, sync_setup_webcam)
     root.update_idletasks()
-    root.geometry("+32+32")
+    dlg_w = max(780, int(root.winfo_reqwidth()))
+    dlg_h = int(root.winfo_reqheight())
+    root.minsize(dlg_w, dlg_h)
+    root.geometry(f"{dlg_w}x{dlg_h}+32+32")
     root.lift()
     root.attributes("-topmost", True)
     root.protocol("WM_DELETE_WINDOW", lambda: (stop_setup_webcam(), root.destroy()))
