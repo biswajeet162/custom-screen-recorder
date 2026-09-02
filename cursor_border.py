@@ -60,6 +60,7 @@ from recorder import (
     list_microphones,
     preferred_camera,
     preferred_microphone,
+    prepare_webcam_patch,
     probe_cameras,
     screen_camera_preview_rect,
     size_for_quality,
@@ -448,6 +449,7 @@ class CyanBorder:
         cam_oy: int,
         shape: str,
         size_key: str,
+        zoom: float = 1.0,
     ) -> None:
         """Draw the webcam inside this border (matches the recorded overlay position)."""
         import cv2
@@ -456,15 +458,24 @@ class CyanBorder:
 
         if encode_w <= 0 or encode_h <= 0:
             return
+        fh, fw = bgr_frame.shape[:2]
         cam_w, cam_h, _, _ = camera_overlay_pixels(
-            encode_w, encode_h, size_key, "bottom_right", ox=cam_ox, oy=cam_oy
+            encode_w,
+            encode_h,
+            size_key,
+            "bottom_right",
+            ox=cam_ox,
+            oy=cam_oy,
+            frame_w=fw,
+            frame_h=fh,
+            zoom=zoom,
         )
         sw = max(32, int(self.box_w * cam_w / encode_w))
         sh = max(32, int(self.box_h * cam_h / encode_h))
         sx = max(0, min(int(self.box_w * cam_ox / encode_w), self.box_w - sw))
         sy = max(0, min(int(self.box_h * cam_oy / encode_h), self.box_h - sh))
-        small = cv2.resize(bgr_frame, (sw, sh), interpolation=cv2.INTER_AREA)
-        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        patch = prepare_webcam_patch(bgr_frame, sw, sh, "square", zoom)
+        rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
         if shape == "circle":
             mask = np.zeros((sh, sw), dtype=np.float32)
             radius = max(1, min(sw, sh) // 2 - 1)
@@ -1155,9 +1166,10 @@ def ask_setup_gui(
     mic_display = tk.StringVar(value=mic_choices[0][0])
     camera_choices = _camera_choices(catalog, working_names)
     camera_display = tk.StringVar(value=camera_choices[0][0])
-    camera_shape_var = tk.StringVar(value="circle")
+    camera_shape_var = tk.StringVar(value="square")
     camera_size_var = tk.StringVar(value="medium")
     camera_position_var = tk.StringVar(value="bottom_right")
+    camera_zoom_var = tk.DoubleVar(value=1.0)
     size_note = tk.StringVar()
     preview_holder: dict[str, CyanBorder | None] = {"ov": None}
     cam_state: dict = {
@@ -1208,13 +1220,26 @@ def ask_setup_gui(
             cam_state["webcam"] = None
         return None
 
+    def webcam_frame_dims() -> tuple[int | None, int | None]:
+        wc = cam_state.get("webcam")
+        if wc is None:
+            return None, None
+        frame = wc.get_frame()
+        if frame is None:
+            return None, None
+        return int(frame.shape[1]), int(frame.shape[0])
+
     def apply_preset_position() -> None:
         enc_w, enc_h = current_encode_size()
+        fw, fh = webcam_frame_dims()
         _, _, ox, oy = camera_overlay_pixels(
             enc_w,
             enc_h,
             camera_size_var.get(),
             camera_position_var.get(),
+            frame_w=fw,
+            frame_h=fh,
+            zoom=float(camera_zoom_var.get()),
         )
         cam_state["encode_ox"] = ox
         cam_state["encode_oy"] = oy
@@ -1278,6 +1303,7 @@ def ask_setup_gui(
                     int(cam_state["encode_oy"] or 0),
                     camera_shape_var.get(),
                     camera_size_var.get(),
+                    float(camera_zoom_var.get()),
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"  Webcam preview error: {exc}")
@@ -1464,6 +1490,33 @@ def ask_setup_gui(
             command=lambda: on_camera_option_change(True),
         ).pack(side="left", padx=(0, 8))
     q_row += 1
+
+    zoom_row = ttk.Frame(frm)
+    zoom_row.grid(row=q_row, column=0, columnspan=3, sticky="ew", padx=28, pady=(4, 2))
+    ttk.Label(zoom_row, text="Camera zoom:").pack(side="left", padx=(0, 8))
+    zoom_scale = ttk.Scale(
+        zoom_row,
+        from_=0.5,
+        to=3.0,
+        orient="horizontal",
+        variable=camera_zoom_var,
+        command=lambda _v: on_camera_option_change(False),
+    )
+    zoom_scale.pack(side="left", fill="x", expand=True, padx=(0, 8))
+    zoom_label = ttk.Label(zoom_row, text="1.0×")
+    zoom_label.pack(side="left")
+
+    def refresh_zoom_label(*_args: object) -> None:
+        zoom_label.config(text=f"{camera_zoom_var.get():.1f}×")
+
+    camera_zoom_var.trace_add("write", refresh_zoom_label)
+    q_row += 1
+    ttk.Label(
+        frm,
+        text="Zoom crops from the center — use Square shape for the full phone frame.",
+        foreground="#666666",
+    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
+    q_row += 1
     ttk.Label(
         frm,
         text="Drag the webcam inside the cyan box to reposition it.",
@@ -1566,6 +1619,7 @@ def ask_setup_gui(
             "camera_position": camera_position_var.get(),
             "camera_ox": cam_state.get("encode_ox"),
             "camera_oy": cam_state.get("encode_oy"),
+            "camera_zoom": float(camera_zoom_var.get()),
             "webcam_capture": stop_setup_webcam(keep_capture=True),
             "record": True,
         }
@@ -1612,11 +1666,15 @@ def ask_setup_gui(
         if ov is None:
             return
         enc_w, enc_h = current_encode_size()
+        fw, fh = webcam_frame_dims()
         cam_w, cam_h, _, _ = camera_overlay_pixels(
             enc_w,
             enc_h,
             camera_size_var.get(),
             camera_position_var.get(),
+            frame_w=fw,
+            frame_h=fh,
+            zoom=float(camera_zoom_var.get()),
         )
         ox = int(round(event.x * enc_w / max(1, ov.box_w)))
         oy = int(round(event.y * enc_h / max(1, ov.box_h)))
@@ -1837,6 +1895,7 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
         "camera_position": camera_position,
         "camera_ox": None,
         "camera_oy": None,
+        "camera_zoom": 1.0,
         "record": True,
     }
 
@@ -1875,6 +1934,7 @@ def resolve_session(
             "camera_position": "bottom_right",
             "camera_ox": None,
             "camera_oy": None,
+            "camera_zoom": 1.0,
             "record": False,
         }
 
@@ -1910,6 +1970,7 @@ def resolve_session(
             "camera_position": "bottom_right",
             "camera_ox": None,
             "camera_oy": None,
+            "camera_zoom": 1.0,
             "record": True,
         }
 
@@ -1941,6 +2002,7 @@ def run(
     camera_position: str,
     camera_ox: int | None,
     camera_oy: int | None,
+    camera_zoom: float,
     catalog: list[CameraDevice],
     webcam_capture: WebcamCapture | None,
     ffmpeg: str | None,
@@ -1955,9 +2017,21 @@ def run(
     camera_position = (
         camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"
     )
+    camera_zoom = max(0.5, min(4.0, float(camera_zoom)))
     if camera_name and (camera_ox is None or camera_oy is None):
+        fw, fh = None, None
+        if webcam is not None:
+            wf = webcam.get_frame()
+            if wf is not None:
+                fh, fw = wf.shape[0], wf.shape[1]
         _, _, camera_ox, camera_oy = camera_overlay_pixels(
-            encode_w, encode_h, camera_size, camera_position
+            encode_w,
+            encode_h,
+            camera_size,
+            camera_position,
+            frame_w=fw,
+            frame_h=fh,
+            zoom=camera_zoom,
         )
 
     overlay = CyanBorder(None, box_w, box_h, border_w, show_label=False)
@@ -2068,6 +2142,7 @@ def run(
             camera_position=camera_position,
             camera_ox=camera_ox,
             camera_oy=camera_oy,
+            camera_zoom=camera_zoom,
         )
 
     def begin_take() -> bool:
@@ -2184,6 +2259,7 @@ def run(
                         int(camera_oy or 0),
                         camera_shape,
                         camera_size,
+                        camera_zoom,
                     )
                 except Exception as exc:  # noqa: BLE001
                     print(f"  Webcam preview error: {exc}")
@@ -2310,11 +2386,12 @@ def main() -> int:
             encode_height=int(session.get("encode_height") or session["height"]),
             mic_name=session["mic_name"],
             camera_name=session.get("camera_name"),
-            camera_shape=str(session.get("camera_shape") or "circle"),
+            camera_shape=str(session.get("camera_shape") or "square"),
             camera_size=str(session.get("camera_size") or "medium"),
             camera_position=str(session.get("camera_position") or "bottom_right"),
             camera_ox=session.get("camera_ox"),
             camera_oy=session.get("camera_oy"),
+            camera_zoom=float(session.get("camera_zoom") or 1.0),
             catalog=catalog,
             webcam_capture=session.get("webcam_capture"),
             ffmpeg=ffmpeg,

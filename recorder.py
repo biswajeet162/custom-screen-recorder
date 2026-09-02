@@ -465,11 +465,37 @@ def camera_overlay_pixels(
     position_key: str,
     ox: int | None = None,
     oy: int | None = None,
+    frame_w: int | None = None,
+    frame_h: int | None = None,
+    zoom: float = 1.0,
 ) -> tuple[int, int, int, int]:
-    """Return cam_w, cam_h, x, y on the encoded frame (square box)."""
+    """Return cam_w, cam_h, x, y on the encoded frame (native camera aspect)."""
     frac = CAMERA_SIZES.get(size_key, CAMERA_SIZES["medium"])
-    cam_h = even(max(48, int(out_h * frac)))
-    cam_w = cam_h
+    max_h = max(48, int(out_h * frac))
+    max_w = max(48, int(out_w * frac))
+    zoom = max(0.5, min(4.0, float(zoom)))
+
+    if frame_w and frame_h and frame_w > 0 and frame_h > 0:
+        aspect = frame_w / frame_h
+        if aspect >= 1.0:
+            cam_h = even(max_h)
+            cam_w = even(min(max_w, int(cam_h * aspect)))
+            if cam_w > max_w:
+                cam_w = even(max_w)
+                cam_h = even(max(48, int(cam_w / aspect)))
+        else:
+            cam_h = even(min(max_h, int(max_w / aspect)))
+            cam_w = even(max(48, int(cam_h * aspect)))
+            if cam_w > max_w:
+                cam_w = even(max_w)
+                cam_h = even(max(48, int(cam_w / aspect)))
+    else:
+        cam_w = cam_h = even(max_h)
+
+    if zoom < 1.0:
+        cam_w = even(max(48, int(cam_w * zoom)))
+        cam_h = even(max(48, int(cam_h * zoom)))
+
     margin = even(max(8, int(min(out_w, out_h) * 0.03)))
     if ox is not None and oy is not None:
         ox_i = max(0, min(int(ox), out_w - cam_w))
@@ -486,6 +512,50 @@ def camera_overlay_pixels(
     ox_i = max(0, min(int(ox_i), out_w - cam_w))
     oy_i = max(0, min(int(oy_i), out_h - cam_h))
     return cam_w, cam_h, ox_i, oy_i
+
+
+def prepare_webcam_patch(
+    cam_bgr,
+    box_w: int,
+    box_h: int,
+    shape: str,
+    zoom: float = 1.0,
+):
+    """Aspect-correct webcam patch with optional center zoom (crop when zoom > 1)."""
+    import cv2
+    import numpy as np
+
+    box_w = max(1, int(box_w))
+    box_h = max(1, int(box_h))
+    zoom = max(0.5, min(4.0, float(zoom)))
+    src = cam_bgr
+    sh, sw = src.shape[:2]
+
+    if zoom > 1.0:
+        crop_w = max(1, int(sw / zoom))
+        crop_h = max(1, int(sh / zoom))
+        x0 = max(0, (sw - crop_w) // 2)
+        y0 = max(0, (sh - crop_h) // 2)
+        src = src[y0:y0 + crop_h, x0:x0 + crop_w]
+
+    sh, sw = src.shape[:2]
+    scale = min(box_w / sw, box_h / sh)
+    nw = max(1, int(sw * scale))
+    nh = max(1, int(sh * scale))
+    resized = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    patch = np.zeros((box_h, box_w, 3), dtype=np.uint8)
+    x_off = (box_w - nw) // 2
+    y_off = (box_h - nh) // 2
+    patch[y_off:y_off + nh, x_off:x_off + nw] = resized
+
+    if shape == "circle":
+        mask = np.zeros((box_h, box_w), dtype=np.float32)
+        radius = min(box_w, box_h) / 2.0 - 1.0
+        cv2.circle(mask, (box_w // 2, box_h // 2), int(max(1, radius)), 1.0, -1)
+        for c in range(3):
+            patch[:, :, c] = (patch[:, :, c] * mask).astype(np.uint8)
+    return patch
 
 
 def screen_camera_preview_rect(
@@ -516,42 +586,39 @@ def screen_camera_preview_rect(
 def composite_webcam_onto(
     dst,
     cam_bgr,
-    cam_w: int,
-    cam_h: int,
+    size_key: str,
+    position_key: str,
     ox: int,
     oy: int,
     shape: str,
+    zoom: float = 1.0,
 ) -> None:
-    """Blend a resized webcam frame onto a BGR screen frame."""
-    import cv2
-    import numpy as np
-
+    """Blend a webcam frame onto a BGR screen frame (native aspect, center zoom)."""
     dh, dw = dst.shape[:2]
-    if ox >= dw or oy >= dh or ox + cam_w <= 0 or oy + cam_h <= 0:
+    fh, fw = cam_bgr.shape[:2]
+    cam_w, cam_h, ox_i, oy_i = camera_overlay_pixels(
+        dw,
+        dh,
+        size_key,
+        position_key,
+        ox=ox,
+        oy=oy,
+        frame_w=fw,
+        frame_h=fh,
+        zoom=zoom,
+    )
+    if ox_i >= dw or oy_i >= dh or ox_i + cam_w <= 0 or oy_i + cam_h <= 0:
         return
-    cam = cv2.resize(cam_bgr, (cam_w, cam_h), interpolation=cv2.INTER_AREA)
-    x0 = max(0, ox)
-    y0 = max(0, oy)
-    x1 = min(dw, ox + cam_w)
-    y1 = min(dh, oy + cam_h)
-    sx0 = x0 - ox
-    sy0 = y0 - oy
+    patch = prepare_webcam_patch(cam_bgr, cam_w, cam_h, shape, zoom)
+    x0 = max(0, ox_i)
+    y0 = max(0, oy_i)
+    x1 = min(dw, ox_i + cam_w)
+    y1 = min(dh, oy_i + cam_h)
+    sx0 = x0 - ox_i
+    sy0 = y0 - oy_i
     sx1 = sx0 + (x1 - x0)
     sy1 = sy0 + (y1 - y0)
-    region = dst[y0:y1, x0:x1]
-    patch = cam[sy0:sy1, sx0:sx1]
-    if shape == "circle":
-        mask = np.zeros((patch.shape[0], patch.shape[1]), dtype=np.float32)
-        cx = patch.shape[1] / 2.0
-        cy = patch.shape[0] / 2.0
-        radius = min(patch.shape[0], patch.shape[1]) / 2.0 - 1.0
-        cv2.circle(mask, (int(cx), int(cy)), int(radius), 1.0, -1)
-        for c in range(3):
-            region[:, :, c] = (
-                patch[:, :, c] * mask + region[:, :, c] * (1.0 - mask)
-            ).astype(np.uint8)
-    else:
-        region[:, :, :] = patch
+    dst[y0:y1, x0:x1] = patch[sy0:sy1, sx0:sx1]
 
 
 class WebcamCapture:
@@ -752,6 +819,7 @@ class ScreenRecorder:
         camera_position: str = "bottom_right",
         camera_ox: int | None = None,
         camera_oy: int | None = None,
+        camera_zoom: float = 1.0,
     ) -> None:
         self.width = even(max(50, width))
         self.height = even(max(50, height))
@@ -768,14 +836,9 @@ class ScreenRecorder:
         self._camera_position = (
             camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"
         )
-        self._cam_w, self._cam_h, self._cam_x, self._cam_y = camera_overlay_pixels(
-            self.width,
-            self.height,
-            self._camera_size,
-            self._camera_position,
-            ox=camera_ox,
-            oy=camera_oy,
-        )
+        self._camera_ox = camera_ox
+        self._camera_oy = camera_oy
+        self._camera_zoom = max(0.5, min(4.0, float(camera_zoom)))
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1024,11 +1087,12 @@ class ScreenRecorder:
                             composite_webcam_onto(
                                 frame,
                                 cam_frame,
-                                self._cam_w,
-                                self._cam_h,
-                                self._cam_x,
-                                self._cam_y,
+                                self._camera_size,
+                                self._camera_position,
+                                int(self._camera_ox or 0),
+                                int(self._camera_oy or 0),
                                 self._camera_shape,
+                                self._camera_zoom,
                             )
                     payload = np.ascontiguousarray(frame).tobytes()
                     try:
