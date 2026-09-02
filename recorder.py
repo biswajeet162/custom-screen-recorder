@@ -458,6 +458,32 @@ def preferred_camera(cameras: list[str]) -> str | None:
     return cameras[0] if cameras else None
 
 
+def overlay_source_dims(
+    frame_w: int,
+    frame_h: int,
+    rotation_deg: int = 0,
+) -> tuple[int, int]:
+    """Display width/height after rotation (90°/270° swap axes)."""
+    rot = int(rotation_deg) % 360
+    if rot in (90, 270):
+        return frame_h, frame_w
+    return frame_w, frame_h
+
+
+def apply_camera_rotation(frame, rotation_deg: int = 0):
+    """Rotate a BGR frame in 90° steps."""
+    import cv2
+
+    rot = int(rotation_deg) % 360
+    if rot == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rot == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rot == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
 def camera_overlay_pixels(
     out_w: int,
     out_h: int,
@@ -468,14 +494,15 @@ def camera_overlay_pixels(
     frame_w: int | None = None,
     frame_h: int | None = None,
     zoom: float = 1.0,
+    rotation_deg: int = 0,
 ) -> tuple[int, int, int, int]:
     """Return cam_w, cam_h, x, y on the encoded frame (native camera aspect)."""
     frac = CAMERA_SIZES.get(size_key, CAMERA_SIZES["medium"])
     max_h = max(48, int(out_h * frac))
     max_w = max(48, int(out_w * frac))
     zoom = max(0.5, min(4.0, float(zoom)))
-
     if frame_w and frame_h and frame_w > 0 and frame_h > 0:
+        frame_w, frame_h = overlay_source_dims(int(frame_w), int(frame_h), rotation_deg)
         aspect = frame_w / frame_h
         if aspect >= 1.0:
             cam_h = even(max_h)
@@ -520,15 +547,16 @@ def prepare_webcam_patch(
     box_h: int,
     shape: str,
     zoom: float = 1.0,
+    rotation_deg: int = 0,
 ):
-    """Aspect-correct webcam patch with optional center zoom (crop when zoom > 1)."""
+    """Aspect-correct webcam patch with center zoom and optional rotation."""
     import cv2
     import numpy as np
 
     box_w = max(1, int(box_w))
     box_h = max(1, int(box_h))
     zoom = max(0.5, min(4.0, float(zoom)))
-    src = cam_bgr
+    src = apply_camera_rotation(cam_bgr, rotation_deg)
     sh, sw = src.shape[:2]
 
     if zoom > 1.0:
@@ -592,6 +620,7 @@ def composite_webcam_onto(
     oy: int,
     shape: str,
     zoom: float = 1.0,
+    rotation_deg: int = 0,
 ) -> None:
     """Blend a webcam frame onto a BGR screen frame (native aspect, center zoom)."""
     dh, dw = dst.shape[:2]
@@ -606,10 +635,11 @@ def composite_webcam_onto(
         frame_w=fw,
         frame_h=fh,
         zoom=zoom,
+        rotation_deg=rotation_deg,
     )
     if ox_i >= dw or oy_i >= dh or ox_i + cam_w <= 0 or oy_i + cam_h <= 0:
         return
-    patch = prepare_webcam_patch(cam_bgr, cam_w, cam_h, shape, zoom)
+    patch = prepare_webcam_patch(cam_bgr, cam_w, cam_h, shape, zoom, rotation_deg)
     x0 = max(0, ox_i)
     y0 = max(0, oy_i)
     x1 = min(dw, ox_i + cam_w)
@@ -820,6 +850,7 @@ class ScreenRecorder:
         camera_ox: int | None = None,
         camera_oy: int | None = None,
         camera_zoom: float = 1.0,
+        camera_rotation: int = 0,
     ) -> None:
         self.width = even(max(50, width))
         self.height = even(max(50, height))
@@ -839,6 +870,7 @@ class ScreenRecorder:
         self._camera_ox = camera_ox
         self._camera_oy = camera_oy
         self._camera_zoom = max(0.5, min(4.0, float(camera_zoom)))
+        self._camera_rotation = int(camera_rotation) % 360
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1093,6 +1125,7 @@ class ScreenRecorder:
                                 int(self._camera_oy or 0),
                                 self._camera_shape,
                                 self._camera_zoom,
+                                self._camera_rotation,
                             )
                     payload = np.ascontiguousarray(frame).tobytes()
                     try:

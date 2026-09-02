@@ -62,6 +62,7 @@ from recorder import (
     preferred_microphone,
     prepare_webcam_patch,
     probe_cameras,
+    overlay_source_dims,
     screen_camera_preview_rect,
     size_for_quality,
 )
@@ -450,6 +451,7 @@ class CyanBorder:
         shape: str,
         size_key: str,
         zoom: float = 1.0,
+        rotation_deg: int = 0,
     ) -> None:
         """Draw the webcam inside this border (matches the recorded overlay position)."""
         import cv2
@@ -459,6 +461,7 @@ class CyanBorder:
         if encode_w <= 0 or encode_h <= 0:
             return
         fh, fw = bgr_frame.shape[:2]
+        disp_w, disp_h = overlay_source_dims(fw, fh, rotation_deg)
         cam_w, cam_h, _, _ = camera_overlay_pixels(
             encode_w,
             encode_h,
@@ -466,15 +469,16 @@ class CyanBorder:
             "bottom_right",
             ox=cam_ox,
             oy=cam_oy,
-            frame_w=fw,
-            frame_h=fh,
+            frame_w=disp_w,
+            frame_h=disp_h,
             zoom=zoom,
+            rotation_deg=rotation_deg,
         )
         sw = max(32, int(self.box_w * cam_w / encode_w))
         sh = max(32, int(self.box_h * cam_h / encode_h))
         sx = max(0, min(int(self.box_w * cam_ox / encode_w), self.box_w - sw))
         sy = max(0, min(int(self.box_h * cam_oy / encode_h), self.box_h - sh))
-        patch = prepare_webcam_patch(bgr_frame, sw, sh, "square", zoom)
+        patch = prepare_webcam_patch(bgr_frame, sw, sh, "square", zoom, rotation_deg)
         rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
         if shape == "circle":
             mask = np.zeros((sh, sw), dtype=np.float32)
@@ -1170,6 +1174,7 @@ def ask_setup_gui(
     camera_size_var = tk.StringVar(value="medium")
     camera_position_var = tk.StringVar(value="bottom_right")
     camera_zoom_var = tk.DoubleVar(value=1.0)
+    camera_rotation_var = tk.IntVar(value=0)
     size_note = tk.StringVar()
     preview_holder: dict[str, CyanBorder | None] = {"ov": None}
     cam_state: dict = {
@@ -1232,14 +1237,20 @@ def ask_setup_gui(
     def apply_preset_position() -> None:
         enc_w, enc_h = current_encode_size()
         fw, fh = webcam_frame_dims()
+        disp_w, disp_h = (
+            overlay_source_dims(fw, fh, int(camera_rotation_var.get()))
+            if fw and fh
+            else (fw, fh)
+        )
         _, _, ox, oy = camera_overlay_pixels(
             enc_w,
             enc_h,
             camera_size_var.get(),
             camera_position_var.get(),
-            frame_w=fw,
-            frame_h=fh,
+            frame_w=disp_w,
+            frame_h=disp_h,
             zoom=float(camera_zoom_var.get()),
+            rotation_deg=int(camera_rotation_var.get()),
         )
         cam_state["encode_ox"] = ox
         cam_state["encode_oy"] = oy
@@ -1304,6 +1315,7 @@ def ask_setup_gui(
                     camera_shape_var.get(),
                     camera_size_var.get(),
                     float(camera_zoom_var.get()),
+                    int(camera_rotation_var.get()),
                 )
             except Exception as exc:  # noqa: BLE001
                 print(f"  Webcam preview error: {exc}")
@@ -1511,6 +1523,39 @@ def ask_setup_gui(
 
     camera_zoom_var.trace_add("write", refresh_zoom_label)
     q_row += 1
+
+    rot_row = ttk.Frame(frm)
+    rot_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=(4, 2))
+    ttk.Label(rot_row, text="Rotate:").pack(side="left", padx=(0, 8))
+    rot_label = ttk.Label(rot_row, text="0°")
+    rot_label.pack(side="right", padx=(8, 0))
+
+    def refresh_rotation_label(*_args: object) -> None:
+        rot_label.config(text=f"{int(camera_rotation_var.get()) % 360}°")
+
+    def set_rotation_deg(deg: int) -> None:
+        camera_rotation_var.set(int(deg) % 360)
+        on_camera_option_change(False)
+
+    def rotate_by(delta: int) -> None:
+        camera_rotation_var.set((int(camera_rotation_var.get()) + delta) % 360)
+        on_camera_option_change(False)
+
+    for text, cmd in (
+        ("← Left", lambda: rotate_by(-90)),
+        ("→ Right", lambda: rotate_by(90)),
+        ("↑ Up", lambda: set_rotation_deg(180)),
+        ("↓ Down", lambda: set_rotation_deg(0)),
+    ):
+        ttk.Button(rot_row, text=text, width=8, command=cmd).pack(side="left", padx=(0, 6))
+    camera_rotation_var.trace_add("write", refresh_rotation_label)
+    q_row += 1
+    ttk.Label(
+        frm,
+        text="Left/Right turn 90°. Up = upside down (180°). Down = normal (0°).",
+        foreground="#666666",
+    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28)
+    q_row += 1
     ttk.Label(
         frm,
         text="Zoom crops from the center — use Square shape for the full phone frame.",
@@ -1620,6 +1665,7 @@ def ask_setup_gui(
             "camera_ox": cam_state.get("encode_ox"),
             "camera_oy": cam_state.get("encode_oy"),
             "camera_zoom": float(camera_zoom_var.get()),
+            "camera_rotation": int(camera_rotation_var.get()) % 360,
             "webcam_capture": stop_setup_webcam(keep_capture=True),
             "record": True,
         }
@@ -1667,14 +1713,20 @@ def ask_setup_gui(
             return
         enc_w, enc_h = current_encode_size()
         fw, fh = webcam_frame_dims()
+        disp_w, disp_h = (
+            overlay_source_dims(fw, fh, int(camera_rotation_var.get()))
+            if fw and fh
+            else (fw, fh)
+        )
         cam_w, cam_h, _, _ = camera_overlay_pixels(
             enc_w,
             enc_h,
             camera_size_var.get(),
             camera_position_var.get(),
-            frame_w=fw,
-            frame_h=fh,
+            frame_w=disp_w,
+            frame_h=disp_h,
             zoom=float(camera_zoom_var.get()),
+            rotation_deg=int(camera_rotation_var.get()),
         )
         ox = int(round(event.x * enc_w / max(1, ov.box_w)))
         oy = int(round(event.y * enc_h / max(1, ov.box_h)))
@@ -1896,6 +1948,7 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
         "camera_ox": None,
         "camera_oy": None,
         "camera_zoom": 1.0,
+        "camera_rotation": 0,
         "record": True,
     }
 
@@ -1935,6 +1988,7 @@ def resolve_session(
             "camera_ox": None,
             "camera_oy": None,
             "camera_zoom": 1.0,
+            "camera_rotation": 0,
             "record": False,
         }
 
@@ -1971,6 +2025,7 @@ def resolve_session(
             "camera_ox": None,
             "camera_oy": None,
             "camera_zoom": 1.0,
+            "camera_rotation": 0,
             "record": True,
         }
 
@@ -2003,6 +2058,7 @@ def run(
     camera_ox: int | None,
     camera_oy: int | None,
     camera_zoom: float,
+    camera_rotation: int,
     catalog: list[CameraDevice],
     webcam_capture: WebcamCapture | None,
     ffmpeg: str | None,
@@ -2018,20 +2074,25 @@ def run(
         camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"
     )
     camera_zoom = max(0.5, min(4.0, float(camera_zoom)))
+    camera_rotation = int(camera_rotation) % 360
     if camera_name and (camera_ox is None or camera_oy is None):
         fw, fh = None, None
         if webcam is not None:
             wf = webcam.get_frame()
             if wf is not None:
                 fh, fw = wf.shape[0], wf.shape[1]
+        disp_w, disp_h = (
+            overlay_source_dims(fw, fh, camera_rotation) if fw and fh else (fw, fh)
+        )
         _, _, camera_ox, camera_oy = camera_overlay_pixels(
             encode_w,
             encode_h,
             camera_size,
             camera_position,
-            frame_w=fw,
-            frame_h=fh,
+            frame_w=disp_w,
+            frame_h=disp_h,
             zoom=camera_zoom,
+            rotation_deg=camera_rotation,
         )
 
     overlay = CyanBorder(None, box_w, box_h, border_w, show_label=False)
@@ -2143,6 +2204,7 @@ def run(
             camera_ox=camera_ox,
             camera_oy=camera_oy,
             camera_zoom=camera_zoom,
+            camera_rotation=camera_rotation,
         )
 
     def begin_take() -> bool:
@@ -2260,6 +2322,7 @@ def run(
                         camera_shape,
                         camera_size,
                         camera_zoom,
+                        camera_rotation,
                     )
                 except Exception as exc:  # noqa: BLE001
                     print(f"  Webcam preview error: {exc}")
@@ -2392,6 +2455,7 @@ def main() -> int:
             camera_ox=session.get("camera_ox"),
             camera_oy=session.get("camera_oy"),
             camera_zoom=float(session.get("camera_zoom") or 1.0),
+            camera_rotation=int(session.get("camera_rotation") or 0),
             catalog=catalog,
             webcam_capture=session.get("webcam_capture"),
             ffmpeg=ffmpeg,
