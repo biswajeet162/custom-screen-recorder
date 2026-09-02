@@ -71,7 +71,12 @@ _HEIGHT_TO_WIDTH_16_9 = {720: 1280, 1080: 1920, 1440: 2560, 2160: 3840}
 NO_AUDIO = "__none__"
 NO_CAMERA = "__none__"
 
-CAMERA_SHAPES = ("square", "circle")
+CAMERA_SHAPES = ("full", "square", "circle")
+CAMERA_SHAPE_LABELS = {
+    "full": "Full frame  (default)",
+    "square": "Square",
+    "circle": "Circle",
+}
 CAMERA_POSITIONS = ("top_left", "top_right", "bottom_left", "bottom_right")
 CAMERA_SIZES: dict[str, float] = {
     "small": 0.14,
@@ -495,8 +500,10 @@ def camera_overlay_pixels(
     frame_h: int | None = None,
     zoom: float = 1.0,
     rotation_deg: int = 0,
+    shape: str = "full",
 ) -> tuple[int, int, int, int]:
-    """Return cam_w, cam_h, x, y on the encoded frame (native camera aspect)."""
+    """Return cam_w, cam_h, x, y on the encoded frame."""
+    shape = shape if shape in CAMERA_SHAPES else "full"
     frac = CAMERA_SIZES.get(size_key, CAMERA_SIZES["medium"])
     max_h = max(48, int(out_h * frac))
     max_w = max(48, int(out_w * frac))
@@ -518,6 +525,10 @@ def camera_overlay_pixels(
                 cam_h = even(max(48, int(cam_w / aspect)))
     else:
         cam_w = cam_h = even(max_h)
+
+    if shape in ("square", "circle"):
+        side = even(max(48, min(cam_w, cam_h)))
+        cam_w = cam_h = side
 
     if zoom < 1.0:
         cam_w = even(max(48, int(cam_w * zoom)))
@@ -541,6 +552,19 @@ def camera_overlay_pixels(
     return cam_w, cam_h, ox_i, oy_i
 
 
+def webcam_circle_mask(box_w: int, box_h: int):
+    """Float mask: 1.0 inside the inscribed circle, 0.0 outside."""
+    import cv2
+    import numpy as np
+
+    box_w = max(1, int(box_w))
+    box_h = max(1, int(box_h))
+    mask = np.zeros((box_h, box_w), dtype=np.float32)
+    radius = min(box_w, box_h) / 2.0 - 0.5
+    cv2.circle(mask, (box_w // 2, box_h // 2), int(max(1, radius)), 1.0, -1)
+    return mask
+
+
 def prepare_webcam_patch(
     cam_bgr,
     box_w: int,
@@ -549,12 +573,13 @@ def prepare_webcam_patch(
     zoom: float = 1.0,
     rotation_deg: int = 0,
 ):
-    """Aspect-correct webcam patch with center zoom and optional rotation."""
+    """Webcam patch: full native frame, center-square crop, or circle."""
     import cv2
     import numpy as np
 
     box_w = max(1, int(box_w))
     box_h = max(1, int(box_h))
+    shape = shape if shape in CAMERA_SHAPES else "full"
     zoom = max(0.5, min(4.0, float(zoom)))
     src = apply_camera_rotation(cam_bgr, rotation_deg)
     sh, sw = src.shape[:2]
@@ -564,25 +589,21 @@ def prepare_webcam_patch(
         crop_h = max(1, int(sh / zoom))
         x0 = max(0, (sw - crop_w) // 2)
         y0 = max(0, (sh - crop_h) // 2)
-        src = src[y0:y0 + crop_h, x0:x0 + crop_w]
+        src = src[y0 : y0 + crop_h, x0 : x0 + crop_w]
+        sh, sw = src.shape[:2]
 
-    sh, sw = src.shape[:2]
-    scale = min(box_w / sw, box_h / sh)
-    nw = max(1, int(sw * scale))
-    nh = max(1, int(sh * scale))
-    resized = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_AREA)
-
-    patch = np.zeros((box_h, box_w, 3), dtype=np.uint8)
-    x_off = (box_w - nw) // 2
-    y_off = (box_h - nh) // 2
-    patch[y_off:y_off + nh, x_off:x_off + nw] = resized
-
-    if shape == "circle":
-        mask = np.zeros((box_h, box_w), dtype=np.float32)
-        radius = min(box_w, box_h) / 2.0 - 1.0
-        cv2.circle(mask, (box_w // 2, box_h // 2), int(max(1, radius)), 1.0, -1)
-        for c in range(3):
-            patch[:, :, c] = (patch[:, :, c] * mask).astype(np.uint8)
+    if shape == "full":
+        patch = cv2.resize(src, (box_w, box_h), interpolation=cv2.INTER_AREA)
+    else:
+        side = min(sw, sh)
+        x0 = (sw - side) // 2
+        y0 = (sh - side) // 2
+        cropped = src[y0 : y0 + side, x0 : x0 + side]
+        patch = cv2.resize(cropped, (box_w, box_h), interpolation=cv2.INTER_AREA)
+        if shape == "circle":
+            mask = webcam_circle_mask(box_w, box_h)
+            for c in range(3):
+                patch[:, :, c] = (patch[:, :, c].astype(np.float32) * mask).astype(np.uint8)
     return patch
 
 
@@ -622,9 +643,10 @@ def composite_webcam_onto(
     zoom: float = 1.0,
     rotation_deg: int = 0,
 ) -> None:
-    """Blend a webcam frame onto a BGR screen frame (native aspect, center zoom)."""
+    """Blend a webcam frame onto a BGR screen frame."""
     dh, dw = dst.shape[:2]
     fh, fw = cam_bgr.shape[:2]
+    shape = shape if shape in CAMERA_SHAPES else "full"
     cam_w, cam_h, ox_i, oy_i = camera_overlay_pixels(
         dw,
         dh,
@@ -636,6 +658,7 @@ def composite_webcam_onto(
         frame_h=fh,
         zoom=zoom,
         rotation_deg=rotation_deg,
+        shape=shape,
     )
     if ox_i >= dw or oy_i >= dh or ox_i + cam_w <= 0 or oy_i + cam_h <= 0:
         return
@@ -648,7 +671,15 @@ def composite_webcam_onto(
     sy0 = y0 - oy_i
     sx1 = sx0 + (x1 - x0)
     sy1 = sy0 + (y1 - y0)
-    dst[y0:y1, x0:x1] = patch[sy0:sy1, sx0:sx1]
+    dst_slice = dst[y0:y1, x0:x1]
+    patch_slice = patch[sy0:sy1, sx0:sx1]
+    if shape == "circle":
+        mask = webcam_circle_mask(cam_w, cam_h)[sy0:sy1, sx0:sx1]
+        inside = mask > 0.5
+        for c in range(3):
+            dst_slice[:, :, c][inside] = patch_slice[:, :, c][inside]
+    else:
+        dst[y0:y1, x0:x1] = patch_slice
 
 
 class WebcamCapture:
@@ -844,7 +875,7 @@ class ScreenRecorder:
         output_path: Path,
         get_frame,
         webcam: WebcamCapture | None = None,
-        camera_shape: str = "circle",
+        camera_shape: str = "full",
         camera_size: str = "medium",
         camera_position: str = "bottom_right",
         camera_ox: int | None = None,
@@ -863,7 +894,7 @@ class ScreenRecorder:
         self.output_path = Path(output_path)
         self.get_frame = get_frame
         self._webcam = webcam
-        self._camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "circle"
+        self._camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "full"
         self._camera_size = camera_size if camera_size in CAMERA_SIZES else "medium"
         self._camera_position = (
             camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"

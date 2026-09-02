@@ -45,6 +45,7 @@ from recorder import (
     CAMERA_POSITION_LABELS,
     CAMERA_POSITIONS,
     CAMERA_SHAPES,
+    CAMERA_SHAPE_LABELS,
     CAMERA_SIZE_LABELS,
     CAMERA_SIZES,
     QUALITY_PRESETS,
@@ -65,6 +66,7 @@ from recorder import (
     prepare_webcam_patch,
     probe_cameras,
     overlay_source_dims,
+    webcam_circle_mask,
     screen_camera_preview_rect,
     size_for_quality,
 )
@@ -571,17 +573,16 @@ class CyanBorder:
             frame_h=disp_h,
             zoom=zoom,
             rotation_deg=rotation_deg,
+            shape=shape,
         )
         sw = max(32, int(self.box_w * cam_w / encode_w))
         sh = max(32, int(self.box_h * cam_h / encode_h))
         sx = max(0, min(int(self.box_w * cam_ox / encode_w), self.box_w - sw))
         sy = max(0, min(int(self.box_h * cam_oy / encode_h), self.box_h - sh))
-        patch = prepare_webcam_patch(bgr_frame, sw, sh, "square", zoom, rotation_deg)
+        patch = prepare_webcam_patch(bgr_frame, sw, sh, shape, zoom, rotation_deg)
         rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
         if shape == "circle":
-            mask = np.zeros((sh, sw), dtype=np.float32)
-            radius = max(1, min(sw, sh) // 2 - 1)
-            cv2.circle(mask, (sw // 2, sh // 2), radius, 1.0, -1)
+            mask = webcam_circle_mask(sw, sh)
             key = np.array([1, 1, 1], dtype=np.float32)
             rgb = (
                 rgb.astype(np.float32) * mask[:, :, None]
@@ -638,6 +639,7 @@ class CyanBorder:
         frame_h: int | None,
         zoom: float,
         rotation_deg: int,
+        shape: str = "full",
     ) -> tuple[int, int, int, int]:
         if encode_w <= 0 or encode_h <= 0:
             return 0, 0, 0, 0
@@ -652,6 +654,7 @@ class CyanBorder:
             frame_h=frame_h,
             zoom=zoom,
             rotation_deg=rotation_deg,
+            shape=shape,
         )
         sw = max(1, int(self.box_w * cam_w / encode_w))
         sh = max(1, int(self.box_h * cam_h / encode_h))
@@ -985,7 +988,7 @@ class WebcamPreview:
         encode_oy: int | None = None,
         on_moved=None,
     ) -> None:
-        self.shape = shape if shape in CAMERA_SHAPES else "circle"
+        self.shape = shape if shape in CAMERA_SHAPES else "full"
         self.size_key = size_key if size_key in CAMERA_SIZES else "medium"
         self.position_key = (
             position_key if position_key in CAMERA_POSITIONS else "bottom_right"
@@ -1157,7 +1160,8 @@ class WebcamPreview:
         if webcam is None:
             return
         import cv2
-        from PIL import Image, ImageDraw, ImageTk
+        import numpy as np
+        from PIL import Image, ImageTk
 
         frame = webcam.get_frame()
         if frame is None:
@@ -1169,15 +1173,22 @@ class WebcamPreview:
             return
         if w < 8 or h < 8:
             return
-        small = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(rgb)
+        patch = prepare_webcam_patch(
+            frame,
+            w,
+            h,
+            self.shape,
+            rotation_deg=0,
+        )
+        rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
         if self.shape == "circle":
-            mask = Image.new("L", (w, h), 0)
-            draw = ImageDraw.Draw(mask)
-            draw.ellipse((0, 0, w - 1, h - 1), fill=255)
-            img = img.convert("RGBA")
-            img.putalpha(mask)
+            mask = webcam_circle_mask(w, h)
+            key = np.array([1, 1, 1], dtype=np.float32)
+            rgb = (
+                rgb.astype(np.float32) * mask[:, :, None]
+                + key * (1.0 - mask[:, :, None])
+            ).astype(np.uint8)
+        img = Image.fromarray(rgb)
         self._photo = ImageTk.PhotoImage(img)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
@@ -1311,7 +1322,7 @@ def ask_setup_gui(
     mic_display = tk.StringVar(value=mic_choices[0][0])
     camera_choices = _camera_choices(catalog, working_names)
     camera_display = tk.StringVar(value=camera_choices[0][0])
-    camera_shape_var = tk.StringVar(value="square")
+    camera_shape_var = tk.StringVar(value="full")
     camera_size_var = tk.StringVar(value="medium")
     camera_position_var = tk.StringVar(value="bottom_right")
     camera_zoom_var = tk.DoubleVar(value=1.0)
@@ -1392,6 +1403,7 @@ def ask_setup_gui(
             frame_h=disp_h,
             zoom=float(camera_zoom_var.get()),
             rotation_deg=int(camera_rotation_var.get()),
+            shape=camera_shape_var.get(),
         )
         cam_state["encode_ox"] = ox
         cam_state["encode_oy"] = oy
@@ -1632,13 +1644,12 @@ def ask_setup_gui(
     shape_row.grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
     ttk.Label(shape_row, text="Shape:").pack(side="left", padx=(0, 8))
     for shape in CAMERA_SHAPES:
-        label = "Circle" if shape == "circle" else "Square"
         ttk.Radiobutton(
             shape_row,
-            text=label,
+            text=CAMERA_SHAPE_LABELS[shape],
             variable=camera_shape_var,
             value=shape,
-            command=lambda: on_camera_option_change(False),
+            command=lambda: on_camera_option_change(True),
         ).pack(side="left", padx=(0, 12))
     r_row += 1
 
@@ -1724,7 +1735,15 @@ def ask_setup_gui(
     r_row += 1
     ttk.Label(
         right,
-        text="Zoom crops from the center — use Square shape for the full phone frame.",
+        text="Full frame shows the entire camera feed. Square crops from the center. Circle is transparent outside.",
+        foreground="#666666",
+        font=hint_font,
+        wraplength=360,
+    ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
+    r_row += 1
+    ttk.Label(
+        right,
+        text="Zoom crops from the center — use Full frame to see the entire phone/camera view.",
         foreground="#666666",
         font=hint_font,
     ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
@@ -1918,6 +1937,7 @@ def ask_setup_gui(
             frame_h=disp_h,
             zoom=float(camera_zoom_var.get()),
             rotation_deg=int(camera_rotation_var.get()),
+            shape=camera_shape_var.get(),
         )
         ox = int(round(event.x * enc_w / max(1, ov.box_w)))
         oy = int(round(event.y * enc_h / max(1, ov.box_h)))
@@ -2032,7 +2052,7 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
     print()
     print("  Webcam overlay")
     camera_name: str | None = None
-    camera_shape = "circle"
+    camera_shape = "full"
     camera_size = "medium"
     camera_position = "bottom_right"
     if catalog:
@@ -2067,9 +2087,9 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
             print("  That number is not in the list.")
         if camera_name:
             print()
-            print("  Shape:  1) Circle   2) Square")
-            shape_raw = input("  Choose shape [1/2] (default 1): ").strip() or "1"
-            camera_shape = "square" if shape_raw == "2" else "circle"
+            print("  Shape:  1) Full frame   2) Square   3) Circle")
+            shape_raw = input("  Choose shape [1/2/3] (default 1): ").strip() or "1"
+            camera_shape = {"2": "square", "3": "circle"}.get(shape_raw, "full")
             print()
             print("  Size:  1) Small   2) Medium   3) Large")
             size_raw = input("  Choose size [1/2/3] (default 2): ").strip() or "2"
@@ -2177,7 +2197,7 @@ def resolve_session(
             "encode_height": encode_h,
             "mic_name": None,
             "camera_name": None,
-            "camera_shape": "circle",
+            "camera_shape": "full",
             "camera_size": "medium",
             "camera_position": "bottom_right",
             "camera_ox": None,
@@ -2215,7 +2235,7 @@ def resolve_session(
             "encode_height": encode_h,
             "mic_name": mic_name,
             "camera_name": preferred_camera([d.name for d in catalog]),
-            "camera_shape": "circle",
+            "camera_shape": "full",
             "camera_size": "medium",
             "camera_position": "bottom_right",
             "camera_ox": None,
@@ -2266,7 +2286,7 @@ def run(
     fps = int(fps) if fps in FPS_CHOICES else 30
     encode_w = even(max(64, int(encode_width)))
     encode_h = even(max(64, int(encode_height)))
-    camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "circle"
+    camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "full"
     camera_size = camera_size if camera_size in CAMERA_SIZES else "medium"
     camera_position = (
         camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"
@@ -2297,6 +2317,7 @@ def run(
             frame_h=disp_h,
             zoom=camera_zoom,
             rotation_deg=camera_rotation,
+            shape=camera_shape,
         )
 
     overlay = CyanBorder(None, box_w, box_h, border_w, show_label=False)
@@ -2409,6 +2430,7 @@ def run(
             frame_h=disp_h,
             zoom=float(cam_live["zoom"]),
             rotation_deg=int(cam_live["rotation"]),
+            shape=camera_shape,
         )
         cam_live["ox"] = ox
         cam_live["oy"] = oy
@@ -2431,6 +2453,7 @@ def run(
             disp_h,
             float(cam_live["zoom"]),
             int(cam_live["rotation"]),
+            camera_shape,
         )
         if sx <= event.x <= sx + sw and sy <= event.y <= sy + sh:
             drag_cam["active"] = True
@@ -2451,6 +2474,7 @@ def run(
             frame_h=disp_h,
             zoom=float(cam_live["zoom"]),
             rotation_deg=int(cam_live["rotation"]),
+            shape=camera_shape,
         )
         ox = int(round(event.x * encode_w / max(1, overlay.box_w)))
         oy = int(round(event.y * encode_h / max(1, overlay.box_h)))
@@ -2792,7 +2816,7 @@ def main() -> int:
             encode_height=int(session.get("encode_height") or session["height"]),
             mic_name=session["mic_name"],
             camera_name=session.get("camera_name"),
-            camera_shape=str(session.get("camera_shape") or "square"),
+            camera_shape=str(session.get("camera_shape") or "full"),
             camera_size=str(session.get("camera_size") or "medium"),
             camera_position=str(session.get("camera_position") or "bottom_right"),
             camera_ox=session.get("camera_ox"),
