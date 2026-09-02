@@ -851,6 +851,7 @@ class ScreenRecorder:
         camera_oy: int | None = None,
         camera_zoom: float = 1.0,
         camera_rotation: int = 0,
+        camera_state: dict | None = None,
     ) -> None:
         self.width = even(max(50, width))
         self.height = even(max(50, height))
@@ -867,10 +868,17 @@ class ScreenRecorder:
         self._camera_position = (
             camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"
         )
-        self._camera_ox = camera_ox
-        self._camera_oy = camera_oy
-        self._camera_zoom = max(0.5, min(4.0, float(camera_zoom)))
-        self._camera_rotation = int(camera_rotation) % 360
+        if camera_state is not None:
+            self._camera_state = camera_state
+        else:
+            self._camera_state = {
+                "ox": camera_ox,
+                "oy": camera_oy,
+                "zoom": max(0.5, min(4.0, float(camera_zoom))),
+                "rotation": int(camera_rotation) % 360,
+                "visible": True,
+                "position": self._camera_position,
+            }
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1113,19 +1121,26 @@ class ScreenRecorder:
                         frame = captured
                     else:
                         frame = _resize_bgr(captured, out_frame)
-                    if self._webcam is not None:
+                    if self._webcam is not None and self._camera_state.get("visible", True):
                         cam_frame = self._webcam.get_frame()
                         if cam_frame is not None:
+                            ox = int(self._camera_state.get("ox") or 0)
+                            oy = int(self._camera_state.get("oy") or 0)
+                            zoom = float(self._camera_state.get("zoom", 1.0))
+                            rotation = int(self._camera_state.get("rotation", 0))
+                            position = str(
+                                self._camera_state.get("position") or self._camera_position
+                            )
                             composite_webcam_onto(
                                 frame,
                                 cam_frame,
                                 self._camera_size,
-                                self._camera_position,
-                                int(self._camera_ox or 0),
-                                int(self._camera_oy or 0),
+                                position,
+                                ox,
+                                oy,
                                 self._camera_shape,
-                                self._camera_zoom,
-                                self._camera_rotation,
+                                zoom,
+                                rotation,
                             )
                     payload = np.ascontiguousarray(frame).tobytes()
                     try:
