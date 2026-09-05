@@ -83,11 +83,17 @@ CAMERA_SIZES: dict[str, float] = {
     "medium": 0.20,
     "large": 0.28,
 }
+CAMERA_SIZE_FRAC_MIN = 0.08
+CAMERA_SIZE_FRAC_MAX = 0.55
+CAMERA_SIZE_FRAC_DEFAULT = 0.20
 CAMERA_SIZE_LABELS = {
     "small": "Small",
     "medium": "Medium  (recommended)",
     "large": "Large",
 }
+# Full-frame overlay uses a larger budget so it matches square/circle visual size.
+FULL_FRAME_SIZE_BOOST = 2**0.5
+FULL_FRAME_FRAC_CAP = CAMERA_SIZE_FRAC_MAX
 CAMERA_POSITION_LABELS = {
     "top_left": "Top left",
     "top_right": "Top right",
@@ -489,6 +495,16 @@ def apply_camera_rotation(frame, rotation_deg: int = 0):
     return frame
 
 
+def camera_size_frac_value(
+    size_key: str | None = None,
+    size_frac: float | None = None,
+) -> float:
+    """Resolve overlay size as a fraction of the recording frame."""
+    if size_frac is not None:
+        return max(CAMERA_SIZE_FRAC_MIN, min(CAMERA_SIZE_FRAC_MAX, float(size_frac)))
+    return CAMERA_SIZES.get(size_key or "medium", CAMERA_SIZE_FRAC_DEFAULT)
+
+
 def camera_overlay_pixels(
     out_w: int,
     out_h: int,
@@ -501,17 +517,24 @@ def camera_overlay_pixels(
     zoom: float = 1.0,
     rotation_deg: int = 0,
     shape: str = "full",
+    size_frac: float | None = None,
 ) -> tuple[int, int, int, int]:
     """Return cam_w, cam_h, x, y on the encoded frame."""
     shape = shape if shape in CAMERA_SHAPES else "full"
-    frac = CAMERA_SIZES.get(size_key, CAMERA_SIZES["medium"])
+    frac = camera_size_frac_value(size_key, size_frac)
+    if shape == "full":
+        frac = min(FULL_FRAME_FRAC_CAP, frac * FULL_FRAME_SIZE_BOOST)
     max_h = max(48, int(out_h * frac))
     max_w = max(48, int(out_w * frac))
     zoom = max(0.5, min(4.0, float(zoom)))
     if frame_w and frame_h and frame_w > 0 and frame_h > 0:
         frame_w, frame_h = overlay_source_dims(int(frame_w), int(frame_h), rotation_deg)
         aspect = frame_w / frame_h
-        if aspect >= 1.0:
+        if shape == "full":
+            scale = min(max_w / frame_w, max_h / frame_h)
+            cam_w = even(max(48, int(frame_w * scale)))
+            cam_h = even(max(48, int(frame_h * scale)))
+        elif aspect >= 1.0:
             cam_h = even(max_h)
             cam_w = even(min(max_w, int(cam_h * aspect)))
             if cam_w > max_w:
@@ -523,12 +546,14 @@ def camera_overlay_pixels(
             if cam_w > max_w:
                 cam_w = even(max_w)
                 cam_h = even(max(48, int(cam_w / aspect)))
+        if shape in ("square", "circle"):
+            side = even(max(48, min(cam_w, cam_h)))
+            cam_w = cam_h = side
     else:
         cam_w = cam_h = even(max_h)
-
-    if shape in ("square", "circle"):
-        side = even(max(48, min(cam_w, cam_h)))
-        cam_w = cam_h = side
+        if shape in ("square", "circle"):
+            side = even(max(48, min(max_w, max_h)))
+            cam_w = cam_h = side
 
     if zoom < 1.0:
         cam_w = even(max(48, int(cam_w * zoom)))
@@ -593,7 +618,14 @@ def prepare_webcam_patch(
         sh, sw = src.shape[:2]
 
     if shape == "full":
-        patch = cv2.resize(src, (box_w, box_h), interpolation=cv2.INTER_AREA)
+        scale = min(box_w / sw, box_h / sh)
+        nw = max(1, int(sw * scale))
+        nh = max(1, int(sh * scale))
+        resized = cv2.resize(src, (nw, nh), interpolation=cv2.INTER_AREA)
+        patch = np.zeros((box_h, box_w, 3), dtype=np.uint8)
+        x_off = (box_w - nw) // 2
+        y_off = (box_h - nh) // 2
+        patch[y_off : y_off + nh, x_off : x_off + nw] = resized
     else:
         side = min(sw, sh)
         x0 = (sw - side) // 2
@@ -642,6 +674,7 @@ def composite_webcam_onto(
     shape: str,
     zoom: float = 1.0,
     rotation_deg: int = 0,
+    size_frac: float | None = None,
 ) -> None:
     """Blend a webcam frame onto a BGR screen frame."""
     dh, dw = dst.shape[:2]
@@ -659,6 +692,7 @@ def composite_webcam_onto(
         zoom=zoom,
         rotation_deg=rotation_deg,
         shape=shape,
+        size_frac=size_frac,
     )
     if ox_i >= dw or oy_i >= dh or ox_i + cam_w <= 0 or oy_i + cam_h <= 0:
         return
@@ -676,6 +710,10 @@ def composite_webcam_onto(
     if shape == "circle":
         mask = webcam_circle_mask(cam_w, cam_h)[sy0:sy1, sx0:sx1]
         inside = mask > 0.5
+        for c in range(3):
+            dst_slice[:, :, c][inside] = patch_slice[:, :, c][inside]
+    elif shape == "full":
+        inside = patch_slice.sum(axis=2) > 0
         for c in range(3):
             dst_slice[:, :, c][inside] = patch_slice[:, :, c][inside]
     else:
@@ -877,6 +915,7 @@ class ScreenRecorder:
         webcam: WebcamCapture | None = None,
         camera_shape: str = "full",
         camera_size: str = "medium",
+        camera_size_frac: float | None = None,
         camera_position: str = "bottom_right",
         camera_ox: int | None = None,
         camera_oy: int | None = None,
@@ -896,6 +935,7 @@ class ScreenRecorder:
         self._webcam = webcam
         self._camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "full"
         self._camera_size = camera_size if camera_size in CAMERA_SIZES else "medium"
+        self._camera_size_frac = camera_size_frac_value(self._camera_size, camera_size_frac)
         self._camera_position = (
             camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"
         )
@@ -905,7 +945,7 @@ class ScreenRecorder:
             self._camera_state = {
                 "ox": camera_ox,
                 "oy": camera_oy,
-                "zoom": max(0.5, min(4.0, float(camera_zoom))),
+                "zoom": max(1.0, min(4.0, float(camera_zoom))),
                 "rotation": int(camera_rotation) % 360,
                 "visible": True,
                 "position": self._camera_position,
@@ -1172,6 +1212,7 @@ class ScreenRecorder:
                                 self._camera_shape,
                                 zoom,
                                 rotation,
+                                size_frac=self._camera_size_frac,
                             )
                     payload = np.ascontiguousarray(frame).tobytes()
                     try:

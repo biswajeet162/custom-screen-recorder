@@ -48,6 +48,10 @@ from recorder import (
     CAMERA_SHAPE_LABELS,
     CAMERA_SIZE_LABELS,
     CAMERA_SIZES,
+    CAMERA_SIZE_FRAC_MIN,
+    CAMERA_SIZE_FRAC_MAX,
+    CAMERA_SIZE_FRAC_DEFAULT,
+    camera_size_frac_value,
     QUALITY_PRESETS,
     ScreenRecorder,
     WebcamCapture,
@@ -552,7 +556,7 @@ class CyanBorder:
         cam_ox: int,
         cam_oy: int,
         shape: str,
-        size_key: str,
+        size_frac: float,
         zoom: float = 1.0,
         rotation_deg: int = 0,
     ) -> None:
@@ -565,10 +569,11 @@ class CyanBorder:
             return
         fh, fw = bgr_frame.shape[:2]
         disp_w, disp_h = overlay_source_dims(fw, fh, rotation_deg)
+        size_frac = camera_size_frac_value(size_frac=size_frac)
         cam_w, cam_h, _, _ = camera_overlay_pixels(
             encode_w,
             encode_h,
-            size_key,
+            "medium",
             "bottom_right",
             ox=cam_ox,
             oy=cam_oy,
@@ -577,6 +582,7 @@ class CyanBorder:
             zoom=zoom,
             rotation_deg=rotation_deg,
             shape=shape,
+            size_frac=size_frac,
         )
         sw = max(32, int(self.box_w * cam_w / encode_w))
         sh = max(32, int(self.box_h * cam_h / encode_h))
@@ -589,6 +595,10 @@ class CyanBorder:
             key = np.array(KEY_RGB, dtype=np.uint8)
             outside = mask <= 0.5
             rgb[outside] = key
+        elif shape == "full":
+            key = np.array(KEY_RGB, dtype=np.uint8)
+            empty = patch.sum(axis=2) == 0
+            rgb[empty] = key
         img = Image.fromarray(rgb)
         self._webcam_photo = ImageTk.PhotoImage(img)
         self.canvas.delete("webcam")
@@ -635,7 +645,7 @@ class CyanBorder:
         encode_h: int,
         cam_ox: int,
         cam_oy: int,
-        size_key: str,
+        size_frac: float,
         frame_w: int | None,
         frame_h: int | None,
         zoom: float,
@@ -647,7 +657,7 @@ class CyanBorder:
         cam_w, cam_h, _, _ = camera_overlay_pixels(
             encode_w,
             encode_h,
-            size_key,
+            "medium",
             "bottom_right",
             ox=cam_ox,
             oy=cam_oy,
@@ -656,6 +666,7 @@ class CyanBorder:
             zoom=zoom,
             rotation_deg=rotation_deg,
             shape=shape,
+            size_frac=size_frac,
         )
         sw = max(1, int(self.box_w * cam_w / encode_w))
         sh = max(1, int(self.box_h * cam_h / encode_h))
@@ -1324,7 +1335,7 @@ def ask_setup_gui(
     camera_choices = _camera_choices(catalog, working_names)
     camera_display = tk.StringVar(value=camera_choices[0][0])
     camera_shape_var = tk.StringVar(value="full")
-    camera_size_var = tk.StringVar(value="medium")
+    camera_size_frac_var = tk.DoubleVar(value=CAMERA_SIZE_FRAC_DEFAULT)
     camera_position_var = tk.StringVar(value="bottom_right")
     camera_zoom_var = tk.DoubleVar(value=1.0)
     camera_rotation_var = tk.IntVar(value=0)
@@ -1398,13 +1409,14 @@ def ask_setup_gui(
         _, _, ox, oy = camera_overlay_pixels(
             enc_w,
             enc_h,
-            camera_size_var.get(),
+            "medium",
             camera_position_var.get(),
             frame_w=disp_w,
             frame_h=disp_h,
             zoom=float(camera_zoom_var.get()),
             rotation_deg=int(camera_rotation_var.get()),
             shape=camera_shape_var.get(),
+            size_frac=float(camera_size_frac_var.get()),
         )
         cam_state["encode_ox"] = ox
         cam_state["encode_oy"] = oy
@@ -1467,7 +1479,7 @@ def ask_setup_gui(
                     int(cam_state["encode_ox"] or 0),
                     int(cam_state["encode_oy"] or 0),
                     camera_shape_var.get(),
-                    camera_size_var.get(),
+                    float(camera_size_frac_var.get()),
                     float(camera_zoom_var.get()),
                     int(camera_rotation_var.get()),
                 )
@@ -1655,16 +1667,40 @@ def ask_setup_gui(
     r_row += 1
 
     size_row = ttk.Frame(right)
-    size_row.grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
-    ttk.Label(size_row, text="Size:").pack(side="left", padx=(0, 8))
+    size_row.grid(row=r_row, column=0, columnspan=3, sticky="ew", padx=28, pady=(4, 2))
+    ttk.Label(size_row, text="Camera size:").pack(side="left", padx=(0, 8))
+    size_slider = ttk.Scale(
+        size_row,
+        from_=CAMERA_SIZE_FRAC_MIN,
+        to=CAMERA_SIZE_FRAC_MAX,
+        orient="horizontal",
+        variable=camera_size_frac_var,
+        command=lambda _v: on_camera_option_change(False),
+    )
+    size_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
+    size_pct_label = ttk.Label(size_row, text="20%")
+    size_pct_label.pack(side="left")
+
+    def refresh_size_pct_label(*_args: object) -> None:
+        size_pct_label.config(text=f"{int(round(camera_size_frac_var.get() * 100))}%")
+
+    def set_size_preset(key: str) -> None:
+        camera_size_frac_var.set(CAMERA_SIZES[key])
+        on_camera_option_change(False)
+
+    camera_size_frac_var.trace_add("write", refresh_size_pct_label)
+    r_row += 1
+
+    size_preset_row = ttk.Frame(right)
+    size_preset_row.grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    ttk.Label(size_preset_row, text="Presets:").pack(side="left", padx=(0, 8))
     for key in CAMERA_SIZES:
-        ttk.Radiobutton(
-            size_row,
-            text=CAMERA_SIZE_LABELS[key],
-            variable=camera_size_var,
-            value=key,
-            command=lambda: on_camera_option_change(False),
-        ).pack(side="left", padx=(0, 10))
+        ttk.Button(
+            size_preset_row,
+            text=CAMERA_SIZE_LABELS[key].split()[0],
+            width=8,
+            command=lambda k=key: set_size_preset(k),
+        ).pack(side="left", padx=(0, 6))
     r_row += 1
 
     pos_row = ttk.Frame(right)
@@ -1682,11 +1718,11 @@ def ask_setup_gui(
 
     zoom_row = ttk.Frame(right)
     zoom_row.grid(row=r_row, column=0, columnspan=3, sticky="ew", padx=28, pady=(4, 2))
-    ttk.Label(zoom_row, text="Camera zoom:").pack(side="left", padx=(0, 8))
+    ttk.Label(zoom_row, text="Crop zoom:").pack(side="left", padx=(0, 8))
     zoom_scale = ttk.Scale(
         zoom_row,
-        from_=0.5,
-        to=3.0,
+        from_=1.0,
+        to=4.0,
         orient="horizontal",
         variable=camera_zoom_var,
         command=lambda _v: on_camera_option_change(False),
@@ -1744,7 +1780,7 @@ def ask_setup_gui(
     r_row += 1
     ttk.Label(
         right,
-        text="Zoom crops from the center — use Full frame to see the entire phone/camera view.",
+        text="Crop zoom magnifies the camera center. Use Camera size to make the overlay bigger.",
         foreground="#666666",
         font=hint_font,
     ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
@@ -1870,7 +1906,7 @@ def ask_setup_gui(
             "mic_name": mic_name,
             "camera_name": camera_name,
             "camera_shape": camera_shape_var.get(),
-            "camera_size": camera_size_var.get(),
+            "camera_size_frac": float(camera_size_frac_var.get()),
             "camera_position": camera_position_var.get(),
             "camera_ox": cam_state.get("encode_ox"),
             "camera_oy": cam_state.get("encode_oy"),
@@ -1932,13 +1968,14 @@ def ask_setup_gui(
         cam_w, cam_h, _, _ = camera_overlay_pixels(
             enc_w,
             enc_h,
-            camera_size_var.get(),
+            "medium",
             camera_position_var.get(),
             frame_w=disp_w,
             frame_h=disp_h,
             zoom=float(camera_zoom_var.get()),
             rotation_deg=int(camera_rotation_var.get()),
             shape=camera_shape_var.get(),
+            size_frac=float(camera_size_frac_var.get()),
         )
         ox = int(round(event.x * enc_w / max(1, ov.box_w)))
         oy = int(round(event.y * enc_h / max(1, ov.box_h)))
@@ -1962,6 +1999,7 @@ def ask_setup_gui(
     custom_h.trace_add("write", on_custom_edit)
 
     refresh_size_labels()
+    refresh_size_pct_label()
     preview.center_on_screen()
     root.after(300, sync_setup_webcam)
     root.update_idletasks()
@@ -2055,6 +2093,7 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
     camera_name: str | None = None
     camera_shape = "full"
     camera_size = "medium"
+    camera_size_frac = CAMERA_SIZE_FRAC_DEFAULT
     camera_position = "bottom_right"
     if catalog:
         cameras = [d.name for d in catalog]
@@ -2092,9 +2131,24 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
             shape_raw = input("  Choose shape [1/2/3] (default 1): ").strip() or "1"
             camera_shape = {"2": "square", "3": "circle"}.get(shape_raw, "full")
             print()
-            print("  Size:  1) Small   2) Medium   3) Large")
-            size_raw = input("  Choose size [1/2/3] (default 2): ").strip() or "2"
-            camera_size = {"1": "small", "2": "medium", "3": "large"}.get(size_raw, "medium")
+            print("  Size:  1) Small   2) Medium   3) Large   4) Custom %")
+            size_raw = input("  Choose size [1-4] (default 2): ").strip() or "2"
+            if size_raw == "4":
+                while True:
+                    pct_raw = input(
+                        f"  Camera size % of frame ({int(CAMERA_SIZE_FRAC_MIN*100)}-"
+                        f"{int(CAMERA_SIZE_FRAC_MAX*100)}, default 20): "
+                    ).strip() or "20"
+                    try:
+                        pct = float(pct_raw)
+                        camera_size_frac = camera_size_frac_value(size_frac=pct / 100.0)
+                        break
+                    except ValueError:
+                        print("  Enter a number for the percentage.")
+                camera_size = "medium"
+            else:
+                camera_size = {"1": "small", "2": "medium", "3": "large"}.get(size_raw, "medium")
+                camera_size_frac = camera_size_frac_value(camera_size)
             print()
             print("  Position:")
             for i, key in enumerate(CAMERA_POSITIONS, start=1):
@@ -2159,6 +2213,7 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
         "camera_name": camera_name,
         "camera_shape": camera_shape,
         "camera_size": camera_size,
+        "camera_size_frac": camera_size_frac,
         "camera_position": camera_position,
         "camera_ox": None,
         "camera_oy": None,
@@ -2200,6 +2255,7 @@ def resolve_session(
             "camera_name": None,
             "camera_shape": "full",
             "camera_size": "medium",
+            "camera_size_frac": CAMERA_SIZE_FRAC_DEFAULT,
             "camera_position": "bottom_right",
             "camera_ox": None,
             "camera_oy": None,
@@ -2238,6 +2294,7 @@ def resolve_session(
             "camera_name": preferred_camera([d.name for d in catalog]),
             "camera_shape": "full",
             "camera_size": "medium",
+            "camera_size_frac": CAMERA_SIZE_FRAC_DEFAULT,
             "camera_position": "bottom_right",
             "camera_ox": None,
             "camera_oy": None,
@@ -2272,6 +2329,7 @@ def run(
     camera_name: str | None,
     camera_shape: str,
     camera_size: str,
+    camera_size_frac: float | None,
     camera_position: str,
     camera_ox: int | None,
     camera_oy: int | None,
@@ -2289,10 +2347,11 @@ def run(
     encode_h = even(max(64, int(encode_height)))
     camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "full"
     camera_size = camera_size if camera_size in CAMERA_SIZES else "medium"
+    camera_size_frac = camera_size_frac_value(camera_size, camera_size_frac)
     camera_position = (
         camera_position if camera_position in CAMERA_POSITIONS else "bottom_right"
     )
-    camera_zoom = max(0.5, min(4.0, float(camera_zoom)))
+    camera_zoom = max(1.0, min(4.0, float(camera_zoom)))
     camera_rotation = int(camera_rotation) % 360
     hotkey_cfg = dict(DEFAULT_SHORTCUTS)
     if shortcuts:
@@ -2319,6 +2378,7 @@ def run(
             zoom=camera_zoom,
             rotation_deg=camera_rotation,
             shape=camera_shape,
+            size_frac=camera_size_frac,
         )
 
     overlay = CyanBorder(None, box_w, box_h, border_w, show_label=False)
@@ -2432,6 +2492,7 @@ def run(
             zoom=float(cam_live["zoom"]),
             rotation_deg=int(cam_live["rotation"]),
             shape=camera_shape,
+            size_frac=camera_size_frac,
         )
         cam_live["ox"] = ox
         cam_live["oy"] = oy
@@ -2449,7 +2510,7 @@ def run(
             encode_h,
             int(cam_live["ox"]),
             int(cam_live["oy"]),
-            camera_size,
+            camera_size_frac,
             disp_w,
             disp_h,
             float(cam_live["zoom"]),
@@ -2476,6 +2537,7 @@ def run(
             zoom=float(cam_live["zoom"]),
             rotation_deg=int(cam_live["rotation"]),
             shape=camera_shape,
+            size_frac=camera_size_frac,
         )
         ox = int(round(event.x * encode_w / max(1, overlay.box_w)))
         oy = int(round(event.y * encode_h / max(1, overlay.box_h)))
@@ -2519,6 +2581,7 @@ def run(
             webcam=webcam,
             camera_shape=camera_shape,
             camera_size=camera_size,
+            camera_size_frac=camera_size_frac,
             camera_position=camera_position,
             camera_state=cam_live,
         )
@@ -2677,7 +2740,7 @@ def run(
                         int(cam_live["ox"]),
                         int(cam_live["oy"]),
                         camera_shape,
-                        camera_size,
+                        camera_size_frac,
                         float(cam_live["zoom"]),
                         int(cam_live["rotation"]),
                     )
@@ -2819,6 +2882,10 @@ def main() -> int:
             camera_name=session.get("camera_name"),
             camera_shape=str(session.get("camera_shape") or "full"),
             camera_size=str(session.get("camera_size") or "medium"),
+            camera_size_frac=camera_size_frac_value(
+                str(session.get("camera_size") or "medium"),
+                session.get("camera_size_frac"),
+            ),
             camera_position=str(session.get("camera_position") or "bottom_right"),
             camera_ox=session.get("camera_ox"),
             camera_oy=session.get("camera_oy"),
