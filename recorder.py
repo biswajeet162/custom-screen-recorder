@@ -72,10 +72,11 @@ NO_AUDIO = "__none__"
 NO_CAMERA = "__none__"
 
 CAMERA_SHAPES = ("full", "square", "circle")
+CAMERA_SHAPE_DEFAULT = "circle"
 CAMERA_SHAPE_LABELS = {
-    "full": "Full frame  (default)",
+    "full": "Full frame",
     "square": "Square",
-    "circle": "Circle",
+    "circle": "Circle  (default)",
 }
 CAMERA_POSITIONS = ("top_left", "top_right", "bottom_left", "bottom_right")
 CAMERA_SIZES: dict[str, float] = {
@@ -85,7 +86,8 @@ CAMERA_SIZES: dict[str, float] = {
 }
 CAMERA_SIZE_FRAC_MIN = 0.08
 CAMERA_SIZE_FRAC_MAX = 0.55
-CAMERA_SIZE_FRAC_DEFAULT = 0.20
+CAMERA_SIZE_FRAC_DEFAULT = 0.43
+CAMERA_ZOOM_DEFAULT = 2.0
 CAMERA_SIZE_LABELS = {
     "small": "Small",
     "medium": "Medium  (recommended)",
@@ -913,13 +915,13 @@ class ScreenRecorder:
         output_path: Path,
         get_frame,
         webcam: WebcamCapture | None = None,
-        camera_shape: str = "full",
+        camera_shape: str = CAMERA_SHAPE_DEFAULT,
         camera_size: str = "medium",
         camera_size_frac: float | None = None,
         camera_position: str = "bottom_right",
         camera_ox: int | None = None,
         camera_oy: int | None = None,
-        camera_zoom: float = 1.0,
+        camera_zoom: float = CAMERA_ZOOM_DEFAULT,
         camera_rotation: int = 0,
         camera_state: dict | None = None,
     ) -> None:
@@ -933,7 +935,7 @@ class ScreenRecorder:
         self.output_path = Path(output_path)
         self.get_frame = get_frame
         self._webcam = webcam
-        self._camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "full"
+        self._camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else CAMERA_SHAPE_DEFAULT
         self._camera_size = camera_size if camera_size in CAMERA_SIZES else "medium"
         self._camera_size_frac = camera_size_frac_value(self._camera_size, camera_size_frac)
         self._camera_position = (

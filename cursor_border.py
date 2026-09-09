@@ -6,9 +6,9 @@ preview of the chosen size, then records the screen inside that rectangle
 with the chosen microphone. Press Ctrl+Caps Lock to park the border.
 Press Ctrl+Caps Lock again to follow the pointer.
 Hold Ctrl+Shift and Right to zoom the border in, or Left to zoom out.
-Press Ctrl+1 / Ctrl+2 / Ctrl+3 to jump to recording zoom levels (smaller
-capture around the cursor, same output size). Press Ctrl+0 for the original
-frame. Hold Ctrl+Alt, click the camera (circle or rectangle), and drag it
+Press Ctrl+1 / Ctrl+2 / Ctrl+3 to glide to recording zoom levels (smaller
+capture around the cursor, same output size). Press Ctrl+0 to glide back to
+the original frame. Hold Ctrl+Alt, click the camera (circle or rectangle), and drag it
 anywhere in the frame. Customize shortcuts and zoom factors in the setup
 window.
 Press Esc to stop and save.
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import math
 import sys
 import time
 from ctypes import wintypes
@@ -54,6 +55,8 @@ from recorder import (
     CAMERA_SIZE_FRAC_MIN,
     CAMERA_SIZE_FRAC_MAX,
     CAMERA_SIZE_FRAC_DEFAULT,
+    CAMERA_SHAPE_DEFAULT,
+    CAMERA_ZOOM_DEFAULT,
     camera_size_frac_value,
     QUALITY_PRESETS,
     ScreenRecorder,
@@ -197,6 +200,16 @@ def modifiers_match(binding: dict[str, object], ctrl: bool, shift: bool, alt: bo
     )
 
 
+def clamp_follow_resume_speed(value: object, default: float | None = None) -> float:
+    if default is None:
+        default = FOLLOW_RESUME_SPEED
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        speed = float(default)
+    return max(FOLLOW_RESUME_SPEED_MIN, min(FOLLOW_RESUME_SPEED_MAX, speed))
+
+
 def clamp_zoom_factor(value: object, default: float = 2.0) -> float:
     try:
         mag = float(value)
@@ -283,6 +296,13 @@ OPTION2_HEIGHT = 1280
 BORDER_WIDTH = 3
 BORDER_COLOR = "#00FFFF"  # cyan
 BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl+Caps Lock)
+
+# After Ctrl+Caps unlocks follow, glide the frame onto the cursor instead of jumping.
+# The same speed eases Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+0 zoom jumps.
+# Pixels per second. Higher = snappier. 0 = instant snap.
+FOLLOW_RESUME_SPEED = 700
+FOLLOW_RESUME_SPEED_MIN = 0
+FOLLOW_RESUME_SPEED_MAX = 8000
 
 # =============================================================================
 
@@ -1071,7 +1091,7 @@ class WebcamPreview:
         encode_oy: int | None = None,
         on_moved=None,
     ) -> None:
-        self.shape = shape if shape in CAMERA_SHAPES else "full"
+        self.shape = shape if shape in CAMERA_SHAPES else CAMERA_SHAPE_DEFAULT
         self.size_key = size_key if size_key in CAMERA_SIZES else "medium"
         self.position_key = (
             position_key if position_key in CAMERA_POSITIONS else "bottom_right"
@@ -1405,16 +1425,17 @@ def ask_setup_gui(
     mic_display = tk.StringVar(value=mic_choices[0][0])
     camera_choices = _camera_choices(catalog, working_names)
     camera_display = tk.StringVar(value=camera_choices[0][0])
-    camera_shape_var = tk.StringVar(value="full")
+    camera_shape_var = tk.StringVar(value=CAMERA_SHAPE_DEFAULT)
     camera_size_frac_var = tk.DoubleVar(value=CAMERA_SIZE_FRAC_DEFAULT)
     camera_position_var = tk.StringVar(value="bottom_right")
-    camera_zoom_var = tk.DoubleVar(value=1.0)
+    camera_zoom_var = tk.DoubleVar(value=CAMERA_ZOOM_DEFAULT)
     camera_rotation_var = tk.IntVar(value=0)
     zoom_level_vars = {
         "1": tk.DoubleVar(value=DEFAULT_ZOOM_LEVELS["1"]),
         "2": tk.DoubleVar(value=DEFAULT_ZOOM_LEVELS["2"]),
         "3": tk.DoubleVar(value=DEFAULT_ZOOM_LEVELS["3"]),
     }
+    follow_resume_speed_var = tk.DoubleVar(value=FOLLOW_RESUME_SPEED)
     size_note = tk.StringVar()
     preview_holder: dict[str, CyanBorder | None] = {"ov": None}
     cam_state: dict = {
@@ -1754,7 +1775,7 @@ def ask_setup_gui(
         command=lambda _v: on_camera_option_change(False),
     )
     size_slider.pack(side="left", fill="x", expand=True, padx=(0, 8))
-    size_pct_label = ttk.Label(size_row, text="20%")
+    size_pct_label = ttk.Label(size_row, text=f"{int(round(CAMERA_SIZE_FRAC_DEFAULT * 100))}%")
     size_pct_label.pack(side="left")
 
     def refresh_size_pct_label(*_args: object) -> None:
@@ -1804,7 +1825,7 @@ def ask_setup_gui(
         command=lambda _v: on_camera_option_change(False),
     )
     zoom_scale.pack(side="left", fill="x", expand=True, padx=(0, 8))
-    zoom_label = ttk.Label(zoom_row, text="1.0×")
+    zoom_label = ttk.Label(zoom_row, text=f"{CAMERA_ZOOM_DEFAULT:.1f}×")
     zoom_label.pack(side="left")
 
     def refresh_zoom_label(*_args: object) -> None:
@@ -1930,6 +1951,34 @@ def ask_setup_gui(
         wraplength=340,
     ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=(0, 4))
     q_row += 1
+    ttk.Label(
+        left,
+        text="Resume follow speed (after Ctrl+Caps unlocks the parked frame)",
+        foreground="#444444",
+    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=(8, 2))
+    q_row += 1
+    resume_row = ttk.Frame(left)
+    resume_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    ttk.Label(resume_row, text="Speed:").pack(side="left", padx=(0, 4))
+    tk.Spinbox(
+        resume_row,
+        from_=FOLLOW_RESUME_SPEED_MIN,
+        to=FOLLOW_RESUME_SPEED_MAX,
+        increment=100,
+        textvariable=follow_resume_speed_var,
+        width=7,
+        format="%.0f",
+    ).pack(side="left")
+    ttk.Label(resume_row, text="px/s  (0 = jump instantly)").pack(side="left", padx=(4, 0))
+    q_row += 1
+    ttk.Label(
+        left,
+        text="Also used when Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+0 change zoom. Higher is faster. 0 snaps.",
+        foreground="#666666",
+        font=hint_font,
+        wraplength=340,
+    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=(0, 4))
+    q_row += 1
 
     ttk.Label(left, textvariable=size_note, foreground="#444444").grid(
         row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 2)
@@ -2015,6 +2064,11 @@ def ask_setup_gui(
             except (tk.TclError, ValueError):
                 return DEFAULT_ZOOM_LEVELS[key]
 
+        try:
+            resume_speed = clamp_follow_resume_speed(follow_resume_speed_var.get())
+        except (tk.TclError, ValueError):
+            resume_speed = FOLLOW_RESUME_SPEED
+
         result = {
             "quality": quality,
             "fps": int(fps_var.get()),
@@ -2037,6 +2091,7 @@ def ask_setup_gui(
                 "2": _zoom_from_ui("2"),
                 "3": _zoom_from_ui("3"),
             },
+            "follow_resume_speed": resume_speed,
             "shortcuts": {k: v.get().strip() for k, v in shortcut_vars.items()},
             "webcam_capture": stop_setup_webcam(keep_capture=True),
             "record": True,
@@ -2216,7 +2271,7 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
     print()
     print("  Webcam overlay")
     camera_name: str | None = None
-    camera_shape = "full"
+    camera_shape = CAMERA_SHAPE_DEFAULT
     camera_size = "medium"
     camera_size_frac = CAMERA_SIZE_FRAC_DEFAULT
     camera_position = "bottom_right"
@@ -2253,17 +2308,25 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
         if camera_name:
             print()
             print("  Shape:  1) Full frame   2) Square   3) Circle")
-            shape_raw = input("  Choose shape [1/2/3] (default 1): ").strip() or "1"
-            camera_shape = {"2": "square", "3": "circle"}.get(shape_raw, "full")
+            shape_raw = input("  Choose shape [1/2/3] (default 3): ").strip() or "3"
+            camera_shape = {"1": "full", "2": "square", "3": "circle"}.get(
+                shape_raw, CAMERA_SHAPE_DEFAULT
+            )
             print()
             print("  Size:  1) Small   2) Medium   3) Large   4) Custom %")
-            size_raw = input("  Choose size [1-4] (default 2): ").strip() or "2"
-            if size_raw == "4":
+            size_raw = input(
+                f"  Choose size [1-4] (default {int(round(CAMERA_SIZE_FRAC_DEFAULT * 100))}%): "
+            ).strip()
+            if not size_raw:
+                camera_size = "medium"
+                camera_size_frac = CAMERA_SIZE_FRAC_DEFAULT
+            elif size_raw == "4":
                 while True:
                     pct_raw = input(
                         f"  Camera size % of frame ({int(CAMERA_SIZE_FRAC_MIN*100)}-"
-                        f"{int(CAMERA_SIZE_FRAC_MAX*100)}, default 20): "
-                    ).strip() or "20"
+                        f"{int(CAMERA_SIZE_FRAC_MAX*100)}, default "
+                        f"{int(round(CAMERA_SIZE_FRAC_DEFAULT * 100))}): "
+                    ).strip() or str(int(round(CAMERA_SIZE_FRAC_DEFAULT * 100)))
                     try:
                         pct = float(pct_raw)
                         camera_size_frac = camera_size_frac_value(size_frac=pct / 100.0)
@@ -2342,9 +2405,10 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
         "camera_position": camera_position,
         "camera_ox": None,
         "camera_oy": None,
-        "camera_zoom": 1.0,
+        "camera_zoom": CAMERA_ZOOM_DEFAULT,
         "camera_rotation": 0,
         "zoom_levels": dict(DEFAULT_ZOOM_LEVELS),
+        "follow_resume_speed": FOLLOW_RESUME_SPEED,
         "shortcuts": dict(DEFAULT_SHORTCUTS),
         "record": True,
     }
@@ -2379,15 +2443,16 @@ def resolve_session(
             "encode_height": encode_h,
             "mic_name": None,
             "camera_name": None,
-            "camera_shape": "full",
+            "camera_shape": CAMERA_SHAPE_DEFAULT,
             "camera_size": "medium",
             "camera_size_frac": CAMERA_SIZE_FRAC_DEFAULT,
             "camera_position": "bottom_right",
             "camera_ox": None,
             "camera_oy": None,
-            "camera_zoom": 1.0,
+            "camera_zoom": CAMERA_ZOOM_DEFAULT,
             "camera_rotation": 0,
             "zoom_levels": dict(DEFAULT_ZOOM_LEVELS),
+            "follow_resume_speed": FOLLOW_RESUME_SPEED,
             "shortcuts": dict(DEFAULT_SHORTCUTS),
             "record": False,
         }
@@ -2419,15 +2484,16 @@ def resolve_session(
             "encode_height": encode_h,
             "mic_name": mic_name,
             "camera_name": preferred_camera([d.name for d in catalog]),
-            "camera_shape": "full",
+            "camera_shape": CAMERA_SHAPE_DEFAULT,
             "camera_size": "medium",
             "camera_size_frac": CAMERA_SIZE_FRAC_DEFAULT,
             "camera_position": "bottom_right",
             "camera_ox": None,
             "camera_oy": None,
-            "camera_zoom": 1.0,
+            "camera_zoom": CAMERA_ZOOM_DEFAULT,
             "camera_rotation": 0,
             "zoom_levels": dict(DEFAULT_ZOOM_LEVELS),
+            "follow_resume_speed": FOLLOW_RESUME_SPEED,
             "shortcuts": dict(DEFAULT_SHORTCUTS),
             "record": True,
         }
@@ -2468,13 +2534,14 @@ def run(
     ffmpeg: str | None,
     shortcuts: dict[str, str] | None = None,
     zoom_levels: dict | None = None,
+    follow_resume_speed: float | None = None,
 ) -> None:
     box_w, box_h = screen_fit(max(50, int(width)), max(50, int(height)))
     border_w = max(2, min(30, int(border_w)))
     fps = int(fps) if fps in FPS_CHOICES else 30
     encode_w = even(max(64, int(encode_width)))
     encode_h = even(max(64, int(encode_height)))
-    camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else "full"
+    camera_shape = camera_shape if camera_shape in CAMERA_SHAPES else CAMERA_SHAPE_DEFAULT
     camera_size = camera_size if camera_size in CAMERA_SIZES else "medium"
     camera_size_frac = camera_size_frac_value(camera_size, camera_size_frac)
     camera_position = (
@@ -2487,6 +2554,7 @@ def run(
         hotkey_cfg.update(shortcuts)
     hotkeys = {key: parse_hotkey(val) for key, val in hotkey_cfg.items()}
     rec_zoom = normalize_zoom_levels(zoom_levels)
+    resume_speed = clamp_follow_resume_speed(follow_resume_speed)
 
     webcam: WebcamCapture | None = webcam_capture
     if camera_name and (camera_ox is None or camera_oy is None):
@@ -2517,13 +2585,20 @@ def run(
     recorder: ScreenRecorder | None = None
     hud: RecordHud | None = None
     stopping = {"done": False}
-    follow = {"locked": False, "center": get_cursor_pos(), "park_was": False}
+    follow = {
+        "locked": False,
+        "catching": False,
+        "center": get_cursor_pos(),
+        "park_was": False,
+    }
     take = {"active": False, "frozen": 0.0, "clock": ""}
     zoom = {
         "level": 1.0,
         "base_w": box_w,
         "base_h": box_h,
         "clock": time.perf_counter(),
+        "target": None,
+        "anim_w": float(box_w),
     }
     cam_live: dict = {
         "ox": int(camera_ox or 0),
@@ -2561,7 +2636,7 @@ def run(
         cx, cy = follow["center"]
         overlay.follow_center(int(cx), int(cy))
 
-    def set_zoom_level(level: float) -> None:
+    def zoom_size_for(level: float) -> tuple[float, int, int]:
         level = max(ZOOM_MIN, min(ZOOM_MAX, float(level)))
         w = even(max(64, round(zoom["base_w"] * level)))
         h = even(max(64, round(w * zoom["base_h"] / zoom["base_w"])))
@@ -2570,23 +2645,73 @@ def run(
             scale = 8192 / long_edge
             w = even(max(64, round(w * scale)))
             h = even(max(64, round(h * scale)))
+        return level, w, h
+
+    def set_zoom_level(level: float, *, keep_target: bool = False, clear_cam: bool = True) -> None:
+        level, w, h = zoom_size_for(level)
+        if not keep_target:
+            zoom["target"] = None
+            zoom["anim_w"] = float(w)
         zoom["level"] = level
         if (w, h) == (overlay.box_w, overlay.box_h):
             return
         overlay.set_size(w, h, fit_to_screen=False)
         place_overlay()
-        if webcam is not None:
+        if clear_cam and webcam is not None:
             overlay.clear_webcam_overlay()
 
     def apply_recording_zoom(mag: float) -> None:
         mag = max(1.0, min(ZOOM_FACTOR_MAX, float(mag)))
-        set_zoom_level(1.0 / mag)
+        target = 1.0 / mag
+        if resume_speed <= 0:
+            zoom["target"] = None
+            set_zoom_level(target)
+        else:
+            zoom["target"] = target
+            zoom["anim_w"] = float(overlay.box_w)
         if mag <= 1.0:
             print("  Zoom 1.0× (original frame)")
         else:
             print(f"  Zoom {mag:.1f}×")
 
-    def move_to_cursor() -> None:
+    def tick_zoom_transition(dt: float) -> None:
+        target = zoom.get("target")
+        if target is None:
+            return
+        target, tw, _th = zoom_size_for(float(target))
+        cw = overlay.box_w
+        if cw == tw:
+            zoom["level"] = target
+            zoom["target"] = None
+            zoom["anim_w"] = float(tw)
+            return
+        dist = abs(tw - cw)
+        taper = min(1.0, dist / 160.0)
+        step = resume_speed * max(dt, 0.0) * (0.22 + 0.78 * taper)
+        anim_w = float(zoom.get("anim_w") or cw)
+        sign = 1.0 if tw > anim_w else -1.0
+        if step <= 0:
+            return
+        if step >= abs(tw - anim_w):
+            zoom["target"] = None
+            set_zoom_level(target, keep_target=False, clear_cam=False)
+            return
+        anim_w += sign * step
+        if sign > 0:
+            anim_w = min(anim_w, float(tw))
+        else:
+            anim_w = max(anim_w, float(tw))
+        zoom["anim_w"] = anim_w
+        new_w = even(max(64, int(round(anim_w))))
+        if sign > 0:
+            new_w = min(new_w, tw)
+        else:
+            new_w = max(new_w, tw)
+        if new_w == cw:
+            return
+        set_zoom_level(new_w / max(1.0, float(zoom["base_w"])), keep_target=True, clear_cam=False)
+
+    def move_to_cursor(dt: float = 0.0) -> None:
         if follow["locked"] or drag_cam["active"]:
             return
         if (
@@ -2597,17 +2722,46 @@ def run(
             and not key_down(VK_SHIFT)
         ):
             return
-        cx, cy = get_cursor_pos()
-        follow["center"] = (int(cx), int(cy))
-        overlay.follow_center(int(cx), int(cy))
+        tx, ty = get_cursor_pos()
+        tx, ty = float(tx), float(ty)
+        if not follow["catching"] or resume_speed <= 0:
+            follow["catching"] = False
+            follow["center"] = (tx, ty)
+            overlay.follow_center(int(tx), int(ty))
+            return
+        cx, cy = follow["center"]
+        dx = tx - float(cx)
+        dy = ty - float(cy)
+        dist = math.hypot(dx, dy)
+        if dist <= 2.0:
+            follow["catching"] = False
+            follow["center"] = (tx, ty)
+            overlay.follow_center(int(tx), int(ty))
+            return
+        # Ease out near the cursor so the last stretch does not slam.
+        taper = min(1.0, dist / 160.0)
+        step = resume_speed * max(dt, 0.0) * (0.22 + 0.78 * taper)
+        if step <= 0:
+            return
+        if step >= dist:
+            follow["catching"] = False
+            follow["center"] = (tx, ty)
+            overlay.follow_center(int(tx), int(ty))
+            return
+        nx = float(cx) + dx * (step / dist)
+        ny = float(cy) + dy * (step / dist)
+        follow["center"] = (nx, ny)
+        overlay.follow_center(int(round(nx)), int(round(ny)))
 
     def toggle_follow() -> None:
         follow["locked"] = not follow["locked"]
         if follow["locked"]:
+            follow["catching"] = False
             overlay.redraw(BORDER_COLOR_LOCKED)
             overlay.canvas.configure(cursor="hand2")
             print("  Border parked — hold Ctrl+Alt and drag the camera, or drag it in the frame.")
         else:
+            follow["catching"] = True
             overlay.redraw(BORDER_COLOR)
             overlay.canvas.configure(cursor="")
             print("  Border following the pointer again.")
@@ -2763,7 +2917,7 @@ def run(
         if take["clock"] != label_key:
             take["clock"] = label_key
             hud.set_recording(bool(take["active"]), elapsed)
-        hud.place_bottom_left(*follow["center"])
+        hud.place_bottom_left(int(follow["center"][0]), int(follow["center"][1]))
 
     def make_recorder() -> ScreenRecorder:
         out = default_output_path(ratio, quality, encode_w, encode_h, fps)
@@ -2918,6 +3072,8 @@ def run(
             if key_edge(int(reset_vk), keys_was):
                 apply_recording_zoom(1.0)
 
+        tick_zoom_transition(dt)
+
         for action, position_key in (
             ("cam_top_left", "top_left"),
             ("cam_top_right", "top_right"),
@@ -2945,7 +3101,7 @@ def run(
                 print(f"  Camera overlay {state}.")
 
         sync_camera_drag(ctrl_down, alt_down, shift_down)
-        move_to_cursor()
+        move_to_cursor(dt)
         sync_hud()
         if webcam is not None and cam_live["visible"]:
             frame = webcam.get_frame()
@@ -2996,6 +3152,7 @@ def run(
         print("  Red rec dot is in the bottom-left corner. Timer always; hover for Start / Stop / Refresh / Exit.")
         print("  Start waits 3-2-1. Stop is immediate. Exit saves and quits.")
         print(f"  Park / follow: {hotkey_cfg['park_follow']}")
+        print(f"  Resume follow speed: {resume_speed:.0f} px/s")
         print(f"  Zoom border: {hotkey_cfg['zoom_out']} / {hotkey_cfg['zoom_in']}")
         print(
             f"  Recording zoom: {hotkey_cfg['zoom_1']} ({rec_zoom['1']:.1f}×), "
@@ -3017,6 +3174,7 @@ def run(
     else:
         print(f"  Overlay only: {ratio}   {box_w}x{box_h}")
         print(f"  Park / follow: {hotkey_cfg['park_follow']}")
+        print(f"  Resume follow speed: {resume_speed:.0f} px/s")
         print(f"  Zoom: {hotkey_cfg['zoom_out']} / {hotkey_cfg['zoom_in']}")
         print(
             f"  Recording zoom: {hotkey_cfg['zoom_1']} ({rec_zoom['1']:.1f}×), "
@@ -3110,7 +3268,7 @@ def main() -> int:
             encode_height=int(session.get("encode_height") or session["height"]),
             mic_name=session["mic_name"],
             camera_name=session.get("camera_name"),
-            camera_shape=str(session.get("camera_shape") or "full"),
+            camera_shape=str(session.get("camera_shape") or CAMERA_SHAPE_DEFAULT),
             camera_size=str(session.get("camera_size") or "medium"),
             camera_size_frac=camera_size_frac_value(
                 str(session.get("camera_size") or "medium"),
@@ -3119,10 +3277,11 @@ def main() -> int:
             camera_position=str(session.get("camera_position") or "bottom_right"),
             camera_ox=session.get("camera_ox"),
             camera_oy=session.get("camera_oy"),
-            camera_zoom=float(session.get("camera_zoom") or 1.0),
+            camera_zoom=float(session.get("camera_zoom") or CAMERA_ZOOM_DEFAULT),
             camera_rotation=int(session.get("camera_rotation") or 0),
             shortcuts=session.get("shortcuts"),
             zoom_levels=session.get("zoom_levels"),
+            follow_resume_speed=session.get("follow_resume_speed"),
             catalog=catalog,
             webcam_capture=session.get("webcam_capture"),
             ffmpeg=ffmpeg,
