@@ -296,6 +296,10 @@ OPTION2_HEIGHT = 1280
 BORDER_WIDTH = 3
 BORDER_COLOR = "#00FFFF"  # cyan
 BORDER_COLOR_LOCKED = "#CCFFFF"  # pale cyan when parked (Ctrl+Caps Lock)
+# Thin dashed cross through the center of the viewfinder (not recorded).
+CROSSHAIR = True
+CROSSHAIR_WIDTH = 1
+CROSSHAIR_DASH = (8, 5)
 
 # After Ctrl+Caps unlocks follow, glide the frame onto the cursor instead of jumping.
 # The same speed eases Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+0 zoom jumps.
@@ -510,6 +514,38 @@ def _draw_inner_bars(canvas: tk.Canvas, w: int, h: int, bw: int, color: str) -> 
     canvas.create_line(x1 - c, y0, x1 - c, y1, fill=color, width=bw, capstyle="projecting", tags="bar")
 
 
+def _draw_center_crosshair(canvas: tk.Canvas, w: int, h: int, bw: int, color: str) -> None:
+    """Dashed mid-width and mid-height guides through the recording box."""
+    canvas.delete("crosshair")
+    if not CROSSHAIR or w < 8 or h < 8:
+        return
+    inset = max(2, int(bw))
+    cx = w / 2.0
+    cy = h / 2.0
+    lw = max(1, int(CROSSHAIR_WIDTH))
+    dash = CROSSHAIR_DASH
+    canvas.create_line(
+        inset,
+        cy,
+        max(inset, w - inset),
+        cy,
+        fill=color,
+        width=lw,
+        dash=dash,
+        tags="crosshair",
+    )
+    canvas.create_line(
+        cx,
+        inset,
+        cx,
+        max(inset, h - inset),
+        fill=color,
+        width=lw,
+        dash=dash,
+        tags="crosshair",
+    )
+
+
 class CyanBorder:
     """Click-through cyan rectangle. Border is drawn inside the frame (visible on all 4 sides)."""
 
@@ -586,6 +622,7 @@ class CyanBorder:
         if color is not None:
             self.color = color
         _draw_inner_bars(self.canvas, self.box_w, self.box_h, self.border_w, self.color)
+        _draw_center_crosshair(self.canvas, self.box_w, self.box_h, self.border_w, self.color)
         self.canvas.delete("sizelabel")
         if self.show_label:
             self.canvas.create_text(
@@ -596,6 +633,10 @@ class CyanBorder:
                 font=("Segoe UI", 16, "bold"),
                 tags="sizelabel",
             )
+        try:
+            self.canvas.tag_raise("webcam")
+        except tk.TclError:
+            pass
 
     def set_size(self, box_w: int, box_h: int, *, fit_to_screen: bool = True) -> None:
         if fit_to_screen:
