@@ -6,8 +6,11 @@ preview of the chosen size, then records the screen inside that rectangle
 with the chosen microphone. Press Ctrl+Caps Lock to park the border.
 Press Ctrl+Caps Lock again to follow the pointer.
 Hold Ctrl+Shift and Right to zoom the border in, or Left to zoom out.
-Press Ctrl+Caps Lock to park the border (then drag the camera inside the frame).
-Customize all shortcuts in the setup window. Press Esc to stop and save.
+Press Ctrl+1 / Ctrl+2 / Ctrl+3 to jump to recording zoom levels (smaller
+capture around the cursor, same output size). Press Ctrl+0 for the original
+frame. Hold Ctrl+Alt, click the camera (circle or rectangle), and drag it
+anywhere in the frame. Customize shortcuts and zoom factors in the setup
+window.
 Press Esc to stop and save.
 """
 
@@ -82,6 +85,7 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOOLWINDOW = 0x00000080
 LWA_COLORKEY = 0x00000001
+VK_LBUTTON = 0x01
 VK_ESCAPE = 0x1B
 VK_CONTROL = 0x11
 VK_SHIFT = 0x10
@@ -93,6 +97,7 @@ VK_DOWN = 0x28
 VK_MENU = 0x12
 VK_NUMPAD0 = 0x60
 VK_NUMPAD1 = 0x61
+VK_NUMPAD2 = 0x62
 VK_NUMPAD3 = 0x63
 VK_NUMPAD7 = 0x67
 VK_NUMPAD9 = 0x69
@@ -102,17 +107,25 @@ DEFAULT_SHORTCUTS: dict[str, str] = {
     "park_follow": "Ctrl+Caps",
     "zoom_in": "Ctrl+Shift+Right",
     "zoom_out": "Ctrl+Shift+Left",
+    "zoom_1": "Ctrl+1",
+    "zoom_2": "Ctrl+2",
+    "zoom_3": "Ctrl+3",
+    "zoom_reset": "Ctrl+0",
     "cam_top_left": "Ctrl+Numpad7",
     "cam_top_right": "Ctrl+Numpad9",
     "cam_bottom_left": "Ctrl+Numpad1",
     "cam_bottom_right": "Ctrl+Numpad3",
-    "cam_toggle": "Ctrl+0",
+    "cam_toggle": "Ctrl+Shift+0",
 }
 
 SHORTCUT_LABELS: dict[str, str] = {
-    "park_follow": "Park / follow border (drag camera while parked)",
-    "zoom_in": "Zoom border in",
-    "zoom_out": "Zoom border out",
+    "park_follow": "Park / follow border",
+    "zoom_in": "Zoom border in (hold)",
+    "zoom_out": "Zoom border out (hold)",
+    "zoom_1": "Zoom level 1",
+    "zoom_2": "Zoom level 2",
+    "zoom_3": "Zoom level 3",
+    "zoom_reset": "Reset zoom (original frame)",
     "cam_top_left": "Camera → top left",
     "cam_top_right": "Camera → top right",
     "cam_bottom_left": "Camera → bottom left",
@@ -120,14 +133,26 @@ SHORTCUT_LABELS: dict[str, str] = {
     "cam_toggle": "Show / hide camera",
 }
 
+DEFAULT_ZOOM_LEVELS: dict[str, float] = {
+    "1": 1.5,
+    "2": 2.5,
+    "3": 4.0,
+}
+ZOOM_FACTOR_MIN = 1.1
+ZOOM_FACTOR_MAX = 8.0
+
 _KEY_ALIASES: dict[str, int] = {
     "left": VK_LEFT,
     "right": VK_RIGHT,
     "up": VK_UP,
     "down": VK_DOWN,
     "0": VK_0,
+    "1": VK_0 + 1,
+    "2": VK_0 + 2,
+    "3": VK_0 + 3,
     "numpad0": VK_NUMPAD0,
     "numpad1": VK_NUMPAD1,
+    "numpad2": VK_NUMPAD2,
     "numpad3": VK_NUMPAD3,
     "numpad7": VK_NUMPAD7,
     "numpad9": VK_NUMPAD9,
@@ -164,15 +189,32 @@ def parse_hotkey(text: str) -> dict[str, object]:
 
 
 def modifiers_match(binding: dict[str, object], ctrl: bool, shift: bool, alt: bool, caps: bool) -> bool:
-    if binding.get("ctrl") and not ctrl:
-        return False
-    if binding.get("shift") and not shift:
-        return False
-    if binding.get("alt") and not alt:
-        return False
-    if binding.get("caps") and not caps:
-        return False
-    return True
+    return (
+        bool(binding.get("ctrl")) == ctrl
+        and bool(binding.get("shift")) == shift
+        and bool(binding.get("alt")) == alt
+        and bool(binding.get("caps")) == caps
+    )
+
+
+def clamp_zoom_factor(value: object, default: float = 2.0) -> float:
+    try:
+        mag = float(value)
+    except (TypeError, ValueError):
+        mag = float(default)
+    return max(ZOOM_FACTOR_MIN, min(ZOOM_FACTOR_MAX, mag))
+
+
+def normalize_zoom_levels(raw: dict | None) -> dict[str, float]:
+    levels = dict(DEFAULT_ZOOM_LEVELS)
+    if not raw:
+        return levels
+    for key in ("1", "2", "3"):
+        if key in raw:
+            levels[key] = clamp_zoom_factor(raw[key], levels[key])
+        elif int(key) in raw:
+            levels[key] = clamp_zoom_factor(raw[int(key)], levels[key])
+    return levels
 
 
 def key_down(vk: int) -> bool:
@@ -184,6 +226,33 @@ def key_edge(vk: int, was_down: dict[int, bool]) -> bool:
     prev = was_down.get(vk, False)
     was_down[vk] = down
     return down and not prev
+
+
+def point_hits_camera(
+    px: float,
+    py: float,
+    sx: int,
+    sy: int,
+    sw: int,
+    sh: int,
+    shape: str,
+) -> bool:
+    """True if (px, py) is on the camera rectangle, or inside the circle mask."""
+    if sw <= 0 or sh <= 0:
+        return False
+    if px < sx or py < sy or px > sx + sw or py > sy + sh:
+        return False
+    if shape == "circle":
+        cx = sx + sw / 2.0
+        cy = sy + sh / 2.0
+        rx = sw / 2.0
+        ry = sh / 2.0
+        dx = (px - cx) / rx
+        dy = (py - cy) / ry
+        return dx * dx + dy * dy <= 1.0
+    return True
+
+
 MONITOR_DEFAULTTONEAREST = 2
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -222,7 +291,7 @@ KEY_COLORREF = 0x00010101  # 0x00bbggrr for RGB(1,1,1)
 KEY_RGB = (1, 1, 1)
 UPDATE_MS = 8  # ~120 FPS — keeps cursor locked to box center
 ZOOM_RATE = 1.55  # size multiplier per second while arrow keys are held (smooth)
-ZOOM_MIN = 0.25
+ZOOM_MIN = 1.0 / ZOOM_FACTOR_MAX
 ZOOM_MAX = 8.0
 
 
@@ -441,6 +510,7 @@ class CyanBorder:
         self.color = BORDER_COLOR
 
         self._webcam_photo = None
+        self._click_through: bool | None = None
         if master is None:
             self.win: tk.Misc = tk.Tk()
         else:
@@ -629,9 +699,10 @@ class CyanBorder:
             pass
 
     def set_click_through(self, through: bool) -> None:
-        """When False, the overlay receives mouse clicks (drag camera while parked)."""
-        if not self.hwnd:
+        """When False, the overlay receives mouse clicks (camera drag)."""
+        if not self.hwnd or self._click_through is through:
             return
+        self._click_through = through
         style = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
         if through:
             style |= WS_EX_TRANSPARENT
@@ -1339,6 +1410,11 @@ def ask_setup_gui(
     camera_position_var = tk.StringVar(value="bottom_right")
     camera_zoom_var = tk.DoubleVar(value=1.0)
     camera_rotation_var = tk.IntVar(value=0)
+    zoom_level_vars = {
+        "1": tk.DoubleVar(value=DEFAULT_ZOOM_LEVELS["1"]),
+        "2": tk.DoubleVar(value=DEFAULT_ZOOM_LEVELS["2"]),
+        "3": tk.DoubleVar(value=DEFAULT_ZOOM_LEVELS["3"]),
+    }
     size_note = tk.StringVar()
     preview_holder: dict[str, CyanBorder | None] = {"ov": None}
     cam_state: dict = {
@@ -1825,6 +1901,36 @@ def ask_setup_gui(
     ttk.Label(custom_row, text="pixels").pack(side="left")
     q_row += 1
 
+    ttk.Label(
+        left,
+        text="Recording zoom (keeps the same aspect; file size stays the same)",
+        foreground="#444444",
+    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=(8, 2))
+    q_row += 1
+    zoom_levels_row = ttk.Frame(left)
+    zoom_levels_row.grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=1)
+    for level_key, level_label in (("1", "Level 1"), ("2", "Level 2"), ("3", "Level 3")):
+        ttk.Label(zoom_levels_row, text=f"{level_label}:").pack(side="left", padx=(0, 4))
+        tk.Spinbox(
+            zoom_levels_row,
+            from_=ZOOM_FACTOR_MIN,
+            to=ZOOM_FACTOR_MAX,
+            increment=0.1,
+            textvariable=zoom_level_vars[level_key],
+            width=5,
+            format="%.1f",
+        ).pack(side="left")
+        ttk.Label(zoom_levels_row, text="×").pack(side="left", padx=(2, 14))
+    q_row += 1
+    ttk.Label(
+        left,
+        text="Ctrl+1 / Ctrl+2 / Ctrl+3 jump to these factors. Ctrl+0 is the original frame.",
+        foreground="#666666",
+        font=hint_font,
+        wraplength=340,
+    ).grid(row=q_row, column=0, columnspan=3, sticky="w", padx=28, pady=(0, 4))
+    q_row += 1
+
     ttk.Label(left, textvariable=size_note, foreground="#444444").grid(
         row=q_row, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 2)
     )
@@ -1847,12 +1953,20 @@ def ask_setup_gui(
     for key in DEFAULT_SHORTCUTS:
         row = ttk.Frame(right)
         row.grid(row=r_row, column=0, columnspan=3, sticky="ew", padx=28, pady=1)
-        ttk.Label(row, text=SHORTCUT_LABELS[key], width=24).pack(side="left")
+        ttk.Label(row, text=SHORTCUT_LABELS[key], width=32).pack(side="left")
         ttk.Entry(row, textvariable=shortcut_vars[key], width=20).pack(side="left", padx=(8, 0))
         r_row += 1
     ttk.Label(
         right,
-        text="Examples: Ctrl+Caps, Ctrl+Shift+Right, Ctrl+Numpad7, Ctrl+0",
+        text="Hold Ctrl+Alt, click the camera, and drag it anywhere in the frame while recording.",
+        foreground="#666666",
+        font=hint_font,
+        wraplength=340,
+    ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28, pady=(0, 4))
+    r_row += 1
+    ttk.Label(
+        right,
+        text="Examples: Ctrl+1, Ctrl+2, Ctrl+3, Ctrl+0, Ctrl+Caps, Ctrl+Shift+Right",
         foreground="#666666",
         font=hint_font,
     ).grid(row=r_row, column=0, columnspan=3, sticky="w", padx=28)
@@ -1895,6 +2009,12 @@ def ask_setup_gui(
         if camera_name == NO_CAMERA:
             camera_name = None
 
+        def _zoom_from_ui(key: str) -> float:
+            try:
+                return clamp_zoom_factor(zoom_level_vars[key].get(), DEFAULT_ZOOM_LEVELS[key])
+            except (tk.TclError, ValueError):
+                return DEFAULT_ZOOM_LEVELS[key]
+
         result = {
             "quality": quality,
             "fps": int(fps_var.get()),
@@ -1912,6 +2032,11 @@ def ask_setup_gui(
             "camera_oy": cam_state.get("encode_oy"),
             "camera_zoom": float(camera_zoom_var.get()),
             "camera_rotation": int(camera_rotation_var.get()) % 360,
+            "zoom_levels": {
+                "1": _zoom_from_ui("1"),
+                "2": _zoom_from_ui("2"),
+                "3": _zoom_from_ui("3"),
+            },
             "shortcuts": {k: v.get().strip() for k, v in shortcut_vars.items()},
             "webcam_capture": stop_setup_webcam(keep_capture=True),
             "record": True,
@@ -2219,6 +2344,7 @@ def ask_setup_cli(mics: list[str], catalog: list[CameraDevice]) -> dict | None:
         "camera_oy": None,
         "camera_zoom": 1.0,
         "camera_rotation": 0,
+        "zoom_levels": dict(DEFAULT_ZOOM_LEVELS),
         "shortcuts": dict(DEFAULT_SHORTCUTS),
         "record": True,
     }
@@ -2261,6 +2387,7 @@ def resolve_session(
             "camera_oy": None,
             "camera_zoom": 1.0,
             "camera_rotation": 0,
+            "zoom_levels": dict(DEFAULT_ZOOM_LEVELS),
             "shortcuts": dict(DEFAULT_SHORTCUTS),
             "record": False,
         }
@@ -2300,6 +2427,7 @@ def resolve_session(
             "camera_oy": None,
             "camera_zoom": 1.0,
             "camera_rotation": 0,
+            "zoom_levels": dict(DEFAULT_ZOOM_LEVELS),
             "shortcuts": dict(DEFAULT_SHORTCUTS),
             "record": True,
         }
@@ -2339,6 +2467,7 @@ def run(
     webcam_capture: WebcamCapture | None,
     ffmpeg: str | None,
     shortcuts: dict[str, str] | None = None,
+    zoom_levels: dict | None = None,
 ) -> None:
     box_w, box_h = screen_fit(max(50, int(width)), max(50, int(height)))
     border_w = max(2, min(30, int(border_w)))
@@ -2357,6 +2486,7 @@ def run(
     if shortcuts:
         hotkey_cfg.update(shortcuts)
     hotkeys = {key: parse_hotkey(val) for key, val in hotkey_cfg.items()}
+    rec_zoom = normalize_zoom_levels(zoom_levels)
 
     webcam: WebcamCapture | None = webcam_capture
     if camera_name and (camera_ox is None or camera_oy is None):
@@ -2404,7 +2534,7 @@ def run(
         "position": camera_position,
     }
     keys_was: dict[int, bool] = {}
-    drag_cam = {"active": False}
+    drag_cam = {"active": False, "grab_x": 0, "grab_y": 0}
 
     if not camera_name and webcam is not None:
         webcam.stop()
@@ -2448,8 +2578,24 @@ def run(
         if webcam is not None:
             overlay.clear_webcam_overlay()
 
+    def apply_recording_zoom(mag: float) -> None:
+        mag = max(1.0, min(ZOOM_FACTOR_MAX, float(mag)))
+        set_zoom_level(1.0 / mag)
+        if mag <= 1.0:
+            print("  Zoom 1.0× (original frame)")
+        else:
+            print(f"  Zoom {mag:.1f}×")
+
     def move_to_cursor() -> None:
-        if follow["locked"]:
+        if follow["locked"] or drag_cam["active"]:
+            return
+        if (
+            webcam is not None
+            and cam_live["visible"]
+            and key_down(VK_CONTROL)
+            and key_down(VK_MENU)
+            and not key_down(VK_SHIFT)
+        ):
             return
         cx, cy = get_cursor_pos()
         follow["center"] = (int(cx), int(cy))
@@ -2457,11 +2603,10 @@ def run(
 
     def toggle_follow() -> None:
         follow["locked"] = not follow["locked"]
-        overlay.set_click_through(not follow["locked"])
         if follow["locked"]:
             overlay.redraw(BORDER_COLOR_LOCKED)
             overlay.canvas.configure(cursor="hand2")
-            print("  Border parked — drag the camera inside the frame. Hotkey again to follow.")
+            print("  Border parked — hold Ctrl+Alt and drag the camera, or drag it in the frame.")
         else:
             overlay.redraw(BORDER_COLOR)
             overlay.canvas.configure(cursor="")
@@ -2498,14 +2643,12 @@ def run(
         cam_live["oy"] = oy
         cam_live["position"] = position_key
 
-    def on_overlay_press(event: tk.Event) -> None:
-        if not follow["locked"] or not cam_live["visible"] or webcam is None:
-            return
+    def camera_local_rect() -> tuple[int, int, int, int]:
         fw, fh = cam_frame_dims()
         disp_w, disp_h = (
             overlay_source_dims(fw, fh, cam_live["rotation"]) if fw and fh else (None, None)
         )
-        sx, sy, sw, sh = overlay.webcam_screen_rect(
+        return overlay.webcam_screen_rect(
             encode_w,
             encode_h,
             int(cam_live["ox"]),
@@ -2517,12 +2660,13 @@ def run(
             int(cam_live["rotation"]),
             camera_shape,
         )
-        if sx <= event.x <= sx + sw and sy <= event.y <= sy + sh:
-            drag_cam["active"] = True
 
-    def on_overlay_drag(event: tk.Event) -> None:
-        if not drag_cam["active"]:
-            return
+    def overlay_local_mouse() -> tuple[int, int]:
+        mx, my = get_cursor_pos()
+        ox, oy = overlay.top_left
+        return int(mx - ox), int(my - oy)
+
+    def move_camera_to_overlay_xy(local_x: float, local_y: float) -> None:
         fw, fh = cam_frame_dims()
         disp_w, disp_h = (
             overlay_source_dims(fw, fh, cam_live["rotation"]) if fw and fh else (None, None)
@@ -2539,11 +2683,67 @@ def run(
             shape=camera_shape,
             size_frac=camera_size_frac,
         )
-        ox = int(round(event.x * encode_w / max(1, overlay.box_w)))
-        oy = int(round(event.y * encode_h / max(1, overlay.box_h)))
+        ox = int(round(local_x * encode_w / max(1, overlay.box_w)))
+        oy = int(round(local_y * encode_h / max(1, overlay.box_h)))
         cam_live["ox"] = max(0, min(ox, encode_w - cam_w))
         cam_live["oy"] = max(0, min(oy, encode_h - cam_h))
         cam_live["position"] = "custom"
+
+    def sync_camera_drag(ctrl_down: bool, alt_down: bool, shift_down: bool) -> None:
+        cam_ready = webcam is not None and cam_live["visible"]
+        drag_mod = bool(ctrl_down and alt_down and not shift_down)
+        freeze_for_drag = cam_ready and (drag_mod or drag_cam["active"])
+        overlay.set_click_through(not (follow["locked"] or freeze_for_drag))
+        if freeze_for_drag:
+            overlay.canvas.configure(cursor="fleur")
+        elif follow["locked"]:
+            overlay.canvas.configure(cursor="hand2")
+        else:
+            overlay.canvas.configure(cursor="")
+
+        pressed = key_edge(VK_LBUTTON, keys_was)
+        if not cam_ready:
+            drag_cam["active"] = False
+            return
+
+        if drag_cam["active"]:
+            if not key_down(VK_LBUTTON):
+                drag_cam["active"] = False
+                return
+            lx, ly = overlay_local_mouse()
+            move_camera_to_overlay_xy(lx - drag_cam["grab_x"], ly - drag_cam["grab_y"])
+            return
+
+        can_grab = follow["locked"] or drag_mod
+        if not can_grab or not pressed:
+            return
+        sx, sy, sw, sh = camera_local_rect()
+        lx, ly = overlay_local_mouse()
+        if not point_hits_camera(lx, ly, sx, sy, sw, sh, camera_shape):
+            return
+        drag_cam["active"] = True
+        drag_cam["grab_x"] = lx - sx
+        drag_cam["grab_y"] = ly - sy
+
+    def on_overlay_press(event: tk.Event) -> None:
+        if not cam_live["visible"] or webcam is None:
+            return
+        ctrl_down = key_down(VK_CONTROL)
+        alt_down = key_down(VK_MENU)
+        if not follow["locked"] and not (ctrl_down and alt_down):
+            return
+        sx, sy, sw, sh = camera_local_rect()
+        if not point_hits_camera(event.x, event.y, sx, sy, sw, sh, camera_shape):
+            return
+        drag_cam["active"] = True
+        drag_cam["grab_x"] = int(event.x) - sx
+        drag_cam["grab_y"] = int(event.y) - sy
+        keys_was[VK_LBUTTON] = True
+
+    def on_overlay_drag(event: tk.Event) -> None:
+        if not drag_cam["active"]:
+            return
+        move_camera_to_overlay_xy(event.x - drag_cam["grab_x"], event.y - drag_cam["grab_y"])
 
     overlay.canvas.bind("<ButtonPress-1>", on_overlay_press)
     overlay.canvas.bind("<B1-Motion>", on_overlay_drag)
@@ -2701,6 +2901,23 @@ def run(
             ):
                 set_zoom_level(zoom["level"] * ((1.0 / ZOOM_RATE) ** dt))
 
+        for action, factor_key in (("zoom_1", "1"), ("zoom_2", "2"), ("zoom_3", "3")):
+            binding = hotkeys[action]
+            vk = binding.get("vk")
+            if vk is None:
+                continue
+            if modifiers_match(binding, ctrl_down, shift_down, alt_down, caps_down):
+                if key_edge(int(vk), keys_was):
+                    apply_recording_zoom(rec_zoom[factor_key])
+
+        reset_b = hotkeys["zoom_reset"]
+        reset_vk = reset_b.get("vk")
+        if reset_vk is not None and modifiers_match(
+            reset_b, ctrl_down, shift_down, alt_down, caps_down
+        ):
+            if key_edge(int(reset_vk), keys_was):
+                apply_recording_zoom(1.0)
+
         for action, position_key in (
             ("cam_top_left", "top_left"),
             ("cam_top_right", "top_right"),
@@ -2727,6 +2944,7 @@ def run(
                 state = "shown" if cam_live["visible"] else "hidden"
                 print(f"  Camera overlay {state}.")
 
+        sync_camera_drag(ctrl_down, alt_down, shift_down)
         move_to_cursor()
         sync_hud()
         if webcam is not None and cam_live["visible"]:
@@ -2779,6 +2997,12 @@ def run(
         print("  Start waits 3-2-1. Stop is immediate. Exit saves and quits.")
         print(f"  Park / follow: {hotkey_cfg['park_follow']}")
         print(f"  Zoom border: {hotkey_cfg['zoom_out']} / {hotkey_cfg['zoom_in']}")
+        print(
+            f"  Recording zoom: {hotkey_cfg['zoom_1']} ({rec_zoom['1']:.1f}×), "
+            f"{hotkey_cfg['zoom_2']} ({rec_zoom['2']:.1f}×), "
+            f"{hotkey_cfg['zoom_3']} ({rec_zoom['3']:.1f}×); "
+            f"{hotkey_cfg['zoom_reset']} original frame"
+        )
         if webcam is not None:
             print(
                 f"  Camera corners: {hotkey_cfg['cam_top_left']}, "
@@ -2786,7 +3010,7 @@ def run(
                 f"{hotkey_cfg['cam_bottom_right']}"
             )
             print(f"  Show / hide camera: {hotkey_cfg['cam_toggle']}")
-            print("  While parked, drag the camera inside the cyan frame.")
+            print("  Hold Ctrl+Alt, click the camera, and drag it anywhere in the frame.")
         print("  Press Esc to quit.")
         hud = RecordHud(root, hud_start, hud_stop, hud_refresh, finish)
         hud.countdown(lambda: begin_take())
@@ -2794,6 +3018,12 @@ def run(
         print(f"  Overlay only: {ratio}   {box_w}x{box_h}")
         print(f"  Park / follow: {hotkey_cfg['park_follow']}")
         print(f"  Zoom: {hotkey_cfg['zoom_out']} / {hotkey_cfg['zoom_in']}")
+        print(
+            f"  Recording zoom: {hotkey_cfg['zoom_1']} ({rec_zoom['1']:.1f}×), "
+            f"{hotkey_cfg['zoom_2']} ({rec_zoom['2']:.1f}×), "
+            f"{hotkey_cfg['zoom_3']} ({rec_zoom['3']:.1f}×); "
+            f"{hotkey_cfg['zoom_reset']} original frame"
+        )
         print("  Press Esc to quit.")
 
     root.protocol("WM_DELETE_WINDOW", finish)
@@ -2892,6 +3122,7 @@ def main() -> int:
             camera_zoom=float(session.get("camera_zoom") or 1.0),
             camera_rotation=int(session.get("camera_rotation") or 0),
             shortcuts=session.get("shortcuts"),
+            zoom_levels=session.get("zoom_levels"),
             catalog=catalog,
             webcam_capture=session.get("webcam_capture"),
             ffmpeg=ffmpeg,
